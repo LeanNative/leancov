@@ -146,7 +146,7 @@ def myTarget : LeanCov.Fuzz.Target := {
 }
 
 def main (args : List String) : IO UInt32 :=
-  LeanCov.Fuzz.main "my-fuzz" #[myTarget] args (corpus := some "Corpus")
+  LeanCov.Fuzz.main #[myTarget] args (corpus := some "Corpus")
 ```
 
 ## Instrumented Constructs

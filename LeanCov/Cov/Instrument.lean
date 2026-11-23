@@ -720,10 +720,27 @@ private def relativeTo (base file : System.FilePath) : String :=
   let pfx := if b.endsWith "/" then b else b ++ "/"
   if f.startsWith pfx then (f.drop pfx.length).toString else f
 
+/-- Locate the Lean sysroot matching this `leancov` binary, even when invoked outside a project
+directory with no `elan` default toolchain configured. -/
+private def resolveSysroot : IO System.FilePath := do
+  if let some sr ← IO.getEnv "LEAN_SYSROOT" then
+    if !sr.isEmpty then return ⟨sr⟩
+  -- Walk up from `leancov`'s own binary to find its `lean-toolchain` so `Init.olean` matches our build.
+  let mut dir? := (← IO.appPath).parent
+  for _ in [:8] do
+    let some d := dir? | break
+    if ← (d / "lean-toolchain").pathExists then
+      let out ← IO.Process.output { cmd := "lean", args := #["--print-prefix"], cwd := some d }
+      if out.exitCode == 0 then
+        let p := out.stdout.trimAscii.copy
+        if !p.isEmpty then return ⟨p⟩
+    dir? := d.parent
+  findSysroot
+
 /-- Build a Lean parser environment loading `Init` plus any extra syntax-providing modules. -/
 unsafe def loadParserEnv (extraImports : Array Name := #[]) : IO Environment := do
   enableInitializersExecution
-  initSearchPath (← findSysroot)
+  initSearchPath (← resolveSysroot)
   let mods := #[{ module := `Init }] ++ extraImports.map fun m => { module := m }
   importModules mods {} (loadExts := true)
 
