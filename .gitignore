@@ -1,0 +1,6 @@
+.lake/
+build/
+*.cov
+*.profraw
+*.profdata
+.DS_Store
