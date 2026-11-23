@@ -15,6 +15,7 @@ inductive BranchKind where
   | letElseOk
   | letElseFail
   | loopBody
+  | loopSkip
   | catchBody
   | andTrue
   | andFalse
@@ -22,6 +23,11 @@ inductive BranchKind where
   | orFalse
   | fnEntry
   deriving Repr, BEq, Inhabited
+
+/-- True for genuine control-flow / decision branch outcomes (excludes straight-line `fn.entry`). -/
+def BranchKind.isBranch : BranchKind → Bool
+  | .fnEntry => false
+  | _ => true
 
 def BranchKind.toString : BranchKind → String
   | .ifThen => "if.then"
@@ -32,6 +38,7 @@ def BranchKind.toString : BranchKind → String
   | .letElseOk => "letElse.ok"
   | .letElseFail => "letElse.fail"
   | .loopBody => "loop.body"
+  | .loopSkip => "loop.skip"
   | .catchBody => "catch.body"
   | .andTrue => "and.true"
   | .andFalse => "and.false"
@@ -48,6 +55,7 @@ def BranchKind.ofString? : String → Option BranchKind
   | "letElse.ok" => some .letElseOk
   | "letElse.fail" => some .letElseFail
   | "loop.body" => some .loopBody
+  | "loop.skip" => some .loopSkip
   | "catch.body" => some .catchBody
   | "and.true" => some .andTrue
   | "and.false" => some .andFalse
@@ -90,6 +98,7 @@ structure FuncInfo where
 /-- Instrumentation manifest (`sites.json`) linking binary counter indices to Lean source locations. -/
 structure Manifest where
   version : Nat := 1
+  armOnMain : Bool := false
   sites : Array Site := #[]
   functions : Array FuncInfo := #[]
   skippedFiles : Array (String × String) := #[]

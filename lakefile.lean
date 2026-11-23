@@ -23,11 +23,11 @@ lean_lib «LeanCov» where
 /-- Compiler/CLI library for source-level AST instrumentation, complexity analysis, and reporting. -/
 lean_lib «LeanCovTool» where
   srcDir := "."
-  roots := #[`LeanCov.Cov]
+  roots := #[`LeanCov.Cov, `LeanCov.CLI]
 
 @[default_target]
 lean_exe «leancov» where
-  root := `LeanCov.CLI
+  root := `LeanCov.Main
   supportInterpreter := true
 
 lean_exe «leancov-rt-test» where

@@ -37,6 +37,13 @@ structure FileReport where
   maxCogCrap : Float
   deriving Repr, Inhabited, ToJson
 
+structure KindReport where
+  kind : String
+  total : Nat
+  hit : Nat
+  cov : Float
+  deriving Repr, Inhabited, ToJson
+
 structure SummaryReport where
   sitesTotal : Nat
   sitesHit : Nat
@@ -52,6 +59,7 @@ structure SummaryReport where
   avgCogCrap : Float
   crapOver30 : Nat
   cogCrapOver30 : Nat
+  byKind : Array KindReport := #[]
   files : Array FileReport
   functions : Array FuncReport
   deriving Repr, Inhabited, ToJson
@@ -154,11 +162,14 @@ def buildReport (m : Manifest) (hits : Array UInt64) : SummaryReport := Id.run d
   for fn in fileNames do
     let ss := fileSites.getD fn #[]
     let fs := fileFns.getD fn #[]
-    let mut sHit : Nat := 0
+    let mut brTot : Nat := 0
+    let mut brHit : Nat := 0
     let mut lineHits : Std.HashMap Nat UInt64 := {}
     for s in ss do
       let c := hitAt hits s.id
-      if c > 0 then sHit := sHit + 1
+      if s.kind.isBranch then
+        brTot := brTot + 1
+        if c > 0 then brHit := brHit + 1
       let prev := lineHits.getD s.line 0
       if c > prev then lineHits := lineHits.insert s.line c
       else if !lineHits.contains s.line then lineHits := lineHits.insert s.line 0
@@ -173,17 +184,31 @@ def buildReport (m : Manifest) (hits : Array UInt64) : SummaryReport := Id.run d
       if fr.sitesHit > 0 then fHit := fHit + 1
       if fr.crap > fMaxCrap then fMaxCrap := fr.crap
       if fr.cogCrap > fMaxCog then fMaxCog := fr.cogCrap
-    totSites := totSites + ss.size
-    totSitesHit := totSitesHit + sHit
+    totSites := totSites + brTot
+    totSitesHit := totSitesHit + brHit
     totLines := totLines + lTot
     totLinesHit := totLinesHit + lHit
     fileReports := fileReports.push {
       file := fn
       functions := fs.size, functionsHit := fHit
-      sitesTotal := ss.size, sitesHit := sHit, branchCov := pctRatio sHit ss.size
+      sitesTotal := brTot, sitesHit := brHit, branchCov := pctRatio brHit brTot
       linesTotal := lTot, linesHit := lHit, lineCov := pctRatio lHit lTot
       maxCrap := fMaxCrap, maxCogCrap := fMaxCog
     }
+
+  -- Per-BranchKind breakdown (shows happy-path vs error/boundary coverage at a glance)
+  let mut kindTot : Std.HashMap String Nat := {}
+  let mut kindHit : Std.HashMap String Nat := {}
+  for s in m.sites do
+    let k := s.kind.toString
+    kindTot := kindTot.insert k (kindTot.getD k 0 + 1)
+    if hitAt hits s.id > 0 then
+      kindHit := kindHit.insert k (kindHit.getD k 0 + 1)
+  let kindKeys := kindTot.toArray.qsort fun a b => a.1 < b.1
+  let mut byKind : Array KindReport := Array.mkEmpty kindKeys.size
+  for (k, tot) in kindKeys do
+    let h := kindHit.getD k 0
+    byKind := byKind.push { kind := k, total := tot, hit := h, cov := pctRatio h tot }
 
   let fnCount := fnReports.size
   let avgCrap := if fnCount == 0 then 0.0 else sumCrap / Float.ofNat fnCount
@@ -194,7 +219,7 @@ def buildReport (m : Manifest) (hits : Array UInt64) : SummaryReport := Id.run d
     functionsTotal := fnCount, functionsHit := fnsHit
     maxCrap, maxCogCrap, avgCrap, avgCogCrap
     crapOver30, cogCrapOver30
-    files := fileReports, functions := fnReports
+    byKind, files := fileReports, functions := fnReports
   }
 
 /-- Export coverage data in standard LCOV `.info` format (compatible with `genhtml`, Codecov, VS Code). -/
@@ -234,19 +259,22 @@ def toLcov (m : Manifest) (hits : Array UInt64) : String := Id.run do
 
     let ss := (fileSites.getD file #[]).qsort fun a b =>
       if a.line != b.line then a.line < b.line else if a.col != b.col then a.col < b.col else a.id < b.id
+    let mut brf : Nat := 0
     let mut brh : Nat := 0
     let mut lineBranchIdx : Std.HashMap Nat Nat := {}
     let mut lineHits : Std.HashMap Nat UInt64 := {}
     for s in ss do
       let c := hitAt hits s.id
-      if c > 0 then brh := brh + 1
-      let bIdx := lineBranchIdx.getD s.line 0
-      lineBranchIdx := lineBranchIdx.insert s.line (bIdx + 1)
-      lines := lines.push s!"BRDA:{s.line},0,{bIdx},{c}"
+      if s.kind.isBranch then
+        brf := brf + 1
+        if c > 0 then brh := brh + 1
+        let bIdx := lineBranchIdx.getD s.line 0
+        lineBranchIdx := lineBranchIdx.insert s.line (bIdx + 1)
+        lines := lines.push s!"BRDA:{s.line},0,{bIdx},{c}"
       let prev := lineHits.getD s.line 0
       if c > prev then lineHits := lineHits.insert s.line c
       else if !lineHits.contains s.line then lineHits := lineHits.insert s.line 0
-    lines := lines.push s!"BRF:{ss.size}"
+    lines := lines.push s!"BRF:{brf}"
     lines := lines.push s!"BRH:{brh}"
 
     let sortedLines := lineHits.toArray.qsort fun a b => a.1 < b.1
@@ -299,7 +327,7 @@ private def sortFuncReports (fns : Array FuncReport) (key : SortKey) : Array Fun
 
 /-- Format a human-readable terminal summary of coverage, CRAP, and Cognitive CRAP. -/
 def formatReport (r : SummaryReport) (topN : Nat := 25) (sortBy : SortKey := .crap)
-    (showFiles : Bool := false) (showMissed : Bool := false) : String := Id.run do
+    (showFiles : Bool := false) (showMissed : Bool := false) (showKinds : Bool := false) : String := Id.run do
   let mut out : Array String := #[]
   out := out.push "=== LeanCov Source-Level Coverage & CRAP ==="
   out := out.push s!"Branches:   {r.sitesHit}/{r.sitesTotal} ({round1 (r.branchCov * 100.0)}%)"
@@ -308,6 +336,15 @@ def formatReport (r : SummaryReport) (topN : Nat := 25) (sortBy : SortKey := .cr
   out := out.push s!"McCabe CRAP:    max {round1 r.maxCrap} | avg {round1 r.avgCrap} | >30: {r.crapOver30}"
   out := out.push s!"Cognitive CRAP: max {round1 r.maxCogCrap} | avg {round1 r.avgCogCrap} | >30: {r.cogCrapOver30}"
 
+  if showKinds && !r.byKind.isEmpty then
+    out := out.push ""
+    out := out.push "By branch kind:"
+    out := out.push s!"  {padRight 14 "Kind"} {padLeft 11 "Hit/Tot"} {padLeft 7 "Cov"}"
+    for kr in r.byKind do
+      let ht := s!"{kr.hit}/{kr.total}"
+      let cv := s!"{round1 (kr.cov * 100.0)}%"
+      out := out.push s!"  {padRight 14 kr.kind} {padLeft 11 ht} {padLeft 7 cv}"
+
   if showFiles && !r.files.isEmpty then
     out := out.push ""
     out := out.push "By file:"
@@ -315,8 +352,8 @@ def formatReport (r : SummaryReport) (topN : Nat := 25) (sortBy : SortKey := .cr
     let sortedFiles := r.files.qsort fun a b =>
       if a.maxCogCrap != b.maxCogCrap then a.maxCogCrap > b.maxCogCrap else a.file < b.file
     for fr in sortedFiles do
-      let br := s!"{round1 (fr.branchCov * 100.0)}%"
-      let ln := s!"{round1 (fr.lineCov * 100.0)}%"
+      let br := if fr.sitesTotal == 0 then "n/a" else s!"{round1 (fr.branchCov * 100.0)}%"
+      let ln := if fr.linesTotal == 0 then "n/a" else s!"{round1 (fr.lineCov * 100.0)}%"
       let ht := s!"{fr.sitesHit}/{fr.sitesTotal}"
       out := out.push s!"  {padLeft 7 br} {padLeft 10 ht} {padLeft 7 ln} {padLeft 7 (round1 fr.maxCrap)} {padLeft 7 (round1 fr.maxCogCrap)}  {fr.file}"
 

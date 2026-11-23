@@ -172,7 +172,7 @@ private def isLineStart (bytePos : Nat) : InstM Bool := do
     if c != 32 && c != 9 then return false
   return true
 
-private def emitDoProbe (seq : Syntax) (kind : BranchKind) (nesting : Nat) : InstM Unit := do
+private def emitDoProbe (seq : Syntax) (kind : BranchKind) (nesting : Nat) : InstM (Option Nat) := do
   if let some (a, b) := firstDoItemSpan? seq then
     let id ← allocSite a kind nesting
     if ← isLineStart a.byteIdx then
@@ -183,6 +183,30 @@ private def emitDoProbe (seq : Syntax) (kind : BranchKind) (nesting : Nat) : Ins
       addWrap a.byteIdx b.byteIdx s!"\n{spaces col}leancov_hit% {id};\n{spaces col}"
     else
       addWrap a.byteIdx b.byteIdx s!"leancov_hit% {id}; "
+    return some id
+  return none
+
+private def emitDoProbe_ (seq : Syntax) (kind : BranchKind) (nesting : Nat) : InstM Unit := do
+  let _ ← emitDoProbe seq kind nesting
+
+private partial def unwrapParen (s : Syntax) : Syntax :=
+  if s.getKind == `Lean.Parser.Term.paren && s.getNumArgs ≥ 2 then
+    unwrapParen (s.getArg 1)
+  else s
+
+private def isBoolOp (s : Syntax) : Bool :=
+  let k := (unwrapParen s).getKind
+  k == `«term_&&_» || k == `«term_||_»
+
+private def emitCondWrap (operand : Syntax) (tKind fKind : BranchKind) (nesting : Nat) : InstM Unit := do
+  if let (some a, some b) := (operand.getPos?, operand.getTailPos?) then
+    let tId ← allocSite a tKind nesting
+    let fId ← allocSite a fKind nesting
+    if (← lineOf a) != (← lineOf b) then
+      let col ← colOf a
+      addWrap a.byteIdx b.byteIdx s!"(LeanCov.cond {tId} {fId} (\n{spaces col}" "))"
+    else
+      addWrap a.byteIdx b.byteIdx s!"(LeanCov.cond {tId} {fId} (" "))"
 
 /-- Add semicolons after all but the last `doSeqItem` of a `doSeqIndent` so it can sit inside `{ ... }`. -/
 private def addSemisBetweenDoItems (seq : Syntax) : InstM Unit := do
@@ -316,7 +340,7 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
           emitOneArmedDoIfBranch args[0]! thenSeq nesting
           walkBody thenSeq (nesting + 1)
         else
-          emitDoProbe thenSeq .ifThen nesting
+          emitDoProbe_ thenSeq .ifThen nesting
           walkBody thenSeq (nesting + 1)
           for idx in [:elseIfs.size] do
             let ei := elseIfs[idx]!
@@ -328,11 +352,11 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
                 emitOneArmedDoIfBranch ei eiSeq nesting
                 walkBody eiSeq (nesting + 1)
               else
-                emitDoProbe eiSeq .ifThen nesting
+                emitDoProbe_ eiSeq .ifThen nesting
                 walkBody eiSeq (nesting + 1)
           if hasElse then
             let elseSeq := elseOpt.getArg 1
-            emitDoProbe elseSeq .ifElse nesting
+            emitDoProbe_ elseSeq .ifElse nesting
             walkBody elseSeq (nesting + 1)
       else
         for a in args do walkBody a nesting
@@ -377,45 +401,79 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
       -- #[let, mut?, letConfig, pat, :=, val, |, fallbackSeq, contOpt]
       if args.size ≥ 6 then walkBody args[5]! nesting
       if args.size ≥ 8 then
-        emitDoProbe args[7]! .letElseFail nesting
+        emitDoProbe_ args[7]! .letElseFail nesting
         walkBody args[7]! (nesting + 1)
       if args.size ≥ 9 then
         let contOpt := args[8]!
         if contOpt.getNumArgs ≥ 1 then
           let contSeq := contOpt.getArg 0
-          emitDoProbe contSeq .letElseOk nesting
+          emitDoProbe_ contSeq .letElseOk nesting
           walkBody contSeq nesting
-    | `Lean.Parser.Term.doFor | `Lean.Parser.Term.doWhile | `Lean.Parser.Term.doRepeat =>
+    | `Lean.Parser.Term.doFor | `Lean.Parser.Term.doWhile =>
       for i in [:args.size] do
         let a := args[i]!
         if i + 1 == args.size then
-          emitDoProbe a .loopBody nesting
+          -- When the loop starts its own line in a `doSeq`, track 0-iteration skips with a pure
+          -- lexical `let mut` flag (works uniformly across Id, StateT, ReaderT, IO, and `while ←`).
+          let trackSkip ← match stx.getPos?, stx.getTailPos? with
+            | some la, some _ => isLineStart la.byteIdx
+            | _, _ => pure false
+          if trackSkip then
+            if let (some (ba, bb), some la, some lb) := (firstDoItemSpan? a, stx.getPos?, stx.getTailPos?) then
+              let bodyId ← allocSite ba .loopBody nesting
+              let skipId ← allocSite la .loopSkip nesting
+              let lcol ← colOf la
+              let flag := s!"__lc_loop_{bodyId}"
+              addWrap la.byteIdx lb.byteIdx
+                s!"let mut {flag} := false;\n{spaces lcol}"
+                s!"\n{spaces lcol}if !{flag} then \{ leancov_hit% {skipId}; pure PUnit.unit };"
+              if ← isLineStart ba.byteIdx then
+                let bcol ← colOf ba
+                addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
+              else if a.getKind == `Lean.Parser.Term.doSeqBracketed then
+                addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId}; {flag} := true; "
+              else if (← lineOf ba) != (← lineOf bb) then
+                let bcol ← colOf ba
+                addWrap ba.byteIdx bb.byteIdx s!"\n{spaces bcol}leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
+              else
+                addWrap ba.byteIdx bb.byteIdx s!"\{ leancov_hit% {bodyId}; {flag} := true; " " }"
+            else
+              emitDoProbe_ a .loopBody nesting
+          else
+            emitDoProbe_ a .loopBody nesting
+          walkBody a (nesting + 1)
+        else
+          walkBody a nesting
+    | `Lean.Parser.Term.doRepeat =>
+      for i in [:args.size] do
+        let a := args[i]!
+        if i + 1 == args.size then
+          emitDoProbe_ a .loopBody nesting
           walkBody a (nesting + 1)
         else
           walkBody a nesting
     | `Lean.Parser.Term.doCatch =>
       if args.size > 0 then
         let body := args[args.size - 1]!
-        emitDoProbe body .catchBody nesting
+        emitDoProbe_ body .catchBody nesting
         walkBody body (nesting + 1)
     | `Lean.Parser.Term.matchAlt =>
       -- #[atom("|"), pats, atom("=>"), rhs]
       if args.size ≥ 4 then
         let rhs := args[3]!
         if isDoSeq rhs then
-          emitDoProbe rhs .matchArm nesting
+          emitDoProbe_ rhs .matchArm nesting
         else
           emitTermWrap rhs .matchArm nesting
         walkBody rhs (nesting + 1)
     | `«term_&&_» | `«term_||_» =>
       if args.size ≥ 3 then
         if (← get).instrumentBoolOps then
-          let lhs := args[0]!
-          if let (some a, some b) := (lhs.getPos?, lhs.getTailPos?) then
-            let (tKind, fKind) := if k == `«term_&&_» then (BranchKind.andTrue, BranchKind.andFalse) else (BranchKind.orTrue, BranchKind.orFalse)
-            let tId ← allocSite a tKind nesting
-            let fId ← allocSite a fKind nesting
-            addWrap a.byteIdx b.byteIdx s!"(LeanCov.cond {tId} {fId} (" "))"
+          let (tKind, fKind) :=
+            if k == `«term_&&_» then (BranchKind.andTrue, BranchKind.andFalse)
+            else (BranchKind.orTrue, BranchKind.orFalse)
+          if !isBoolOp args[0]! then emitCondWrap args[0]! tKind fKind nesting
+          if !isBoolOp args[2]! then emitCondWrap args[2]! tKind fKind nesting
         walkBody args[0]! nesting
         walkBody args[2]! nesting
       else
@@ -427,8 +485,8 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
       -- #[letId, binders, typeSpecOpt, ":=", val]
       if args.size ≥ 5 then walkBody args[4]! nesting
     | `Lean.Parser.Term.letPatDecl =>
-      -- #[pat, typeSpecOpt, ":=", val]
-      if args.size ≥ 4 then walkBody args[3]! nesting
+      -- #[pat, optPats, typeSpecOpt, ":=", val]
+      if args.size ≥ 5 then walkBody args[4]! nesting
     | `Lean.Parser.Term.doLet =>
       -- #[let, ..., letDecl]
       for a in args do walkBody a nesting
@@ -445,13 +503,13 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
         let fb := args[4]!
         if fb.getNumArgs ≥ 2 then
           let fallbackSeq := fb.getArg 1
-          emitDoProbe fallbackSeq .letElseFail nesting
+          emitDoProbe_ fallbackSeq .letElseFail nesting
           walkBody fallbackSeq (nesting + 1)
           if fb.getNumArgs ≥ 3 then
             let contOpt := fb.getArg 2
             if contOpt.getNumArgs ≥ 1 then
               let contSeq := contOpt.getArg 0
-              emitDoProbe contSeq .letElseOk nesting
+              emitDoProbe_ contSeq .letElseOk nesting
               walkBody contSeq nesting
     | `Lean.Parser.Term.structInstField =>
       -- `field := val` (skip the field name, instrument only `val`)
@@ -513,8 +571,17 @@ private def qualifyName (ns : List String) (name : String) : String :=
 private def headerIsModule (hdr : Syntax) : Bool :=
   hdr.getNumArgs > 0 && (hdr.getArg 0).getNumArgs > 0
 
-private def isStructInstBody (valStx : Syntax) : Bool :=
-  valStx.getKind == `Lean.Parser.Command.whereStructInst
+private def hasSigBinders (sigStx : Syntax) : Bool :=
+  sigStx.getNumArgs ≥ 1 && (sigStx.getArg 0).getNumArgs > 0
+
+/-- True if `valStx` is a `fun x => rhs` whose inner `rhs` we can wrap with `.fnEntry`. -/
+private def basicFunRhs? (body : Syntax) : Option Syntax :=
+  if body.getKind == `Lean.Parser.Term.fun && body.getNumArgs ≥ 2 then
+    let inner := body.getArg 1
+    if inner.getKind == `Lean.Parser.Term.basicFun && inner.getNumArgs ≥ 4 then
+      some (inner.getArg 3)
+    else none
+  else none
 
 /-- Instrument one `def` or `instance` declaration, returning its `FuncInfo` if eligible. -/
 private def instrumentDecl (ns : List String) (cmd : Syntax) (mods inner : Syntax) : InstM (Option FuncInfo) := do
@@ -554,6 +621,7 @@ private def instrumentDecl (ns : List String) (cmd : Syntax) (mods inner : Synta
   let qname := qualifyName ns rawName
   modify fun st => { st with decl := qname, declSiteIds := #[] }
   -- Walk the declaration value
+  let mut isPureConstant := false
   match valStx.getKind with
   | `Lean.Parser.Command.declValSimple =>
     -- #[":=", bodyTerm, terminationSuffix, whereDeclsOpt]
@@ -562,18 +630,27 @@ private def instrumentDecl (ns : List String) (cmd : Syntax) (mods inner : Synta
       walkBody body 0
       if valStx.getNumArgs ≥ 4 then
         walkBody (valStx.getArg 3) 0
-      -- Straight-line function with 0 branch sites: attach a function-entry probe
+      -- Straight-line callable function with 0 branch sites: attach a function-entry probe.
+      -- Skip pure 0-arg constants/CAFs (e.g. `def nonceSize := 12`, `instance : Foo := ⟨...⟩`)
+      -- so module initializers never inflate function/branch coverage.
       if (← get).declSiteIds.isEmpty then
         if body.getKind == `Lean.Parser.Term.do && body.getNumArgs ≥ 2 then
-          emitDoProbe (body.getArg 1) .fnEntry 0
-        else
+          emitDoProbe_ (body.getArg 1) .fnEntry 0
+        else if let some lamRhs := basicFunRhs? body then
+          emitTermWrap lamRhs .fnEntry 0
+        else if isDef && hasSigBinders sigStx then
           emitTermWrap body .fnEntry 0
+        else
+          isPureConstant := true
   | `Lean.Parser.Command.declValEqns =>
     walkBody valStx 0
   | `Lean.Parser.Command.whereStructInst =>
     -- `instance : Foo where f := ...` — instrument each field's RHS
     walkBody valStx 0
+    if (← get).declSiteIds.isEmpty then
+      isPureConstant := true
   | _ => pure ()
+  if isPureConstant then return none
   let siteIds := (← get).declSiteIds
   return some {
     name := qname
@@ -697,6 +774,114 @@ def instrumentSource (env : Environment) (relFile src : String) (startSiteId : N
   let rewritten := applyEdits src (#[headerEdit] ++ shifted)
   return { instrumented := rewritten, sites := st.sites, functions := funcs, nextSiteId := st.nextSiteId }
 
+private def wrapMainExpr (fileMap : FileMap) (e : Syntax) (acc : Array Edit) : Array Edit :=
+  match e.getPos?, e.getTailPos? with
+  | some a, some b =>
+    let la := (fileMap.toPosition a).line
+    let lb := (fileMap.toPosition b).line
+    let col := (fileMap.toPosition a).column
+    let openTxt :=
+      if la != lb then s!"(LeanCov.arm () >>= fun _ => (\n{spaces col}"
+      else "(LeanCov.arm () >>= fun _ => ("
+    acc.push { startPos := a.byteIdx, endPos := b.byteIdx, seq := acc.size + 1, openText := openTxt, closeText := "))" }
+  | _, _ => acc
+
+private partial def wrapMainEqns (fileMap : FileMap) (s : Syntax) (acc : Array Edit) : Array Edit :=
+  match s with
+  | .node _ `Lean.Parser.Term.matchAlt args =>
+    if args.size ≥ 4 then wrapMainExpr fileMap args[3]! acc else acc
+  | .node _ _ args => args.foldl (fun a c => wrapMainEqns fileMap c a) acc
+  | _ => acc
+
+private partial def collectMainArmEdits (fileMap : FileMap) (cmd : Syntax)
+    (scopeStack : List (Bool × List String)) (ns : List String) (edits : Array Edit) :
+    List (Bool × List String) × List String × Array Edit :=
+  match cmd.getKind with
+  | `Lean.Parser.Command.namespace =>
+    if cmd.getNumArgs ≥ 2 then
+      let parts := match cmd.getArg 1 with
+        | .ident _ _ n _ => n.components.map Name.toString
+        | _ => []
+      ((true, parts) :: scopeStack, parts.reverse ++ ns, edits)
+    else (scopeStack, ns, edits)
+  | `Lean.Parser.Command.section =>
+    let parts :=
+      if cmd.getNumArgs ≥ 2 && (cmd.getArg 1).getNumArgs ≥ 1 then
+        match (cmd.getArg 1).getArg 0 with
+        | .ident _ _ n _ => n.components.map Name.toString
+        | _ => []
+      else []
+    ((false, parts) :: scopeStack, ns, edits)
+  | `Lean.Parser.Command.end =>
+    match scopeStack with
+    | (isNs, parts) :: rest =>
+      let ns' := if isNs then ns.drop parts.length else ns
+      (rest, ns', edits)
+    | [] => ([], [], edits)
+  | `Lean.Parser.Command.in =>
+    if cmd.getNumArgs ≥ 3 then collectMainArmEdits fileMap (cmd.getArg 2) scopeStack ns edits
+    else (scopeStack, ns, edits)
+  | `Lean.Parser.Command.declaration =>
+    if cmd.getNumArgs ≥ 2 then
+      let inner := cmd.getArg 1
+      if inner.getKind == `Lean.Parser.Command.definition && inner.getNumArgs ≥ 4 then
+        let nm := declIdName (inner.getArg 1)
+        if (ns.isEmpty && nm == "main") || nm == "_root_.main" then
+          let valStx := inner.getArg 3
+          let edits' := match valStx.getKind with
+            | `Lean.Parser.Command.declValSimple =>
+              if valStx.getNumArgs ≥ 2 then wrapMainExpr fileMap (valStx.getArg 1) edits else edits
+            | `Lean.Parser.Command.declValEqns =>
+              wrapMainEqns fileMap valStx edits
+            | _ => edits
+          (scopeStack, ns, edits')
+        else (scopeStack, ns, edits)
+      else (scopeStack, ns, edits)
+    else (scopeStack, ns, edits)
+  | _ => (scopeStack, ns, edits)
+
+/-- Inject `LeanCov.arm ()` at entry to top-level `def main` so `LEAN_COV_DEFER_INIT=1` ignores
+all probe hits fired during module initialization (`initialize_*`) before `main` begins. -/
+def armMainInSource (env : Environment) (relFile src : String) : IO (String × Bool) := do
+  if (src.splitOn "main").length ≤ 1 then return (src, false)
+  let ic := mkInputContext src relFile
+  let (hdr, pstate, msgs0) ← parseHeader ic
+  if msgs0.hasErrors then return (src, false)
+  let pmctx : ParserModuleContext := { env, options := {} }
+  let mut ps := pstate
+  let mut msgs := msgs0
+  let mut cmds : Array Syntax := #[]
+  repeat
+    let (cmd, ps', msgs') := parseCommand ic pmctx ps msgs
+    ps := ps'
+    msgs := msgs'
+    if isTerminalCommand cmd then break
+    cmds := cmds.push cmd
+  if msgs.hasErrors then return (src, false)
+  let mut scopeStack : List (Bool × List String) := []
+  let mut ns : List String := []
+  let mut edits : Array Edit := #[]
+  for cmd in cmds do
+    let (ss, ns', ed) := collectMainArmEdits ic.fileMap cmd scopeStack ns edits
+    scopeStack := ss
+    ns := ns'
+    edits := ed
+  if edits.isEmpty then return (src, false)
+  let alreadyImports :=
+    (src.splitOn "import LeanCov.DoSyntax").length > 1 ||
+    (src.splitOn "import LeanCov.Runtime").length > 1
+  let allEdits :=
+    if alreadyImports then edits
+    else
+      let hdrEnd := (hdr.raw.getTailPos?.map (·.byteIdx)).getD 0
+      let importLine :=
+        if headerIsModule hdr.raw then
+          if hdrEnd == 0 then "public import LeanCov.Runtime\n" else "\npublic import LeanCov.Runtime\n"
+        else
+          if hdrEnd == 0 then "import LeanCov.Runtime\n" else "\nimport LeanCov.Runtime\n"
+      #[{ startPos := hdrEnd, endPos := hdrEnd, seq := 0, openText := importLine }] ++ edits
+  return (applyEdits src allEdits, true)
+
 /-- Recursively collect all `.lean` files under `dir`, sorted deterministically. -/
 partial def collectLeanFiles (dir : System.FilePath) : IO (Array System.FilePath) := do
   let mut out : Array System.FilePath := #[]
@@ -744,15 +929,18 @@ unsafe def loadParserEnv (extraImports : Array Name := #[]) : IO Environment := 
   let mods := #[{ module := `Init }] ++ extraImports.map fun m => { module := m }
   importModules mods {} (loadExts := true)
 
-/-- Instrument all `.lean` files in `srcRoots` into `outRoot`, returning the combined `Manifest`. -/
+/-- Instrument all `.lean` files in `srcRoot` into `outRoot`, returning the combined `Manifest`.
+When `armMains` is true, top-level `def main` entry points (even in excluded files) are armed
+with `LeanCov.arm ()` so `LEAN_COV_DEFER_INIT=1` suppresses module-init probe hits. -/
 unsafe def instrumentTree (srcRoot outRoot : System.FilePath) (cfg : InstrumentConfig := {})
-    (startSiteId : Nat := 0) (relPrefix : String := "") : IO Manifest := do
+    (startSiteId : Nat := 0) (relPrefix : String := "") (armMains : Bool := false) : IO Manifest := do
   let env ← loadParserEnv cfg.extraImports
   let files ← collectLeanFiles srcRoot
   let mut nextId := startSiteId
   let mut allSites : Array Site := #[]
   let mut allFuncs : Array FuncInfo := #[]
   let mut skipped : Array (String × String) := #[]
+  let mut armedAny : Bool := false
   for f in files do
     let relLocal := relativeTo srcRoot f
     let relDisplay := if relPrefix.isEmpty then relLocal else s!"{relPrefix}/{relLocal}"
@@ -760,8 +948,10 @@ unsafe def instrumentTree (srcRoot outRoot : System.FilePath) (cfg : InstrumentC
     let dest := outRoot / relLocal
     if isExcluded relDisplay cfg.exclude || isExcluded relLocal cfg.exclude then
       unless cfg.analyzeOnly do
+        let (outSrc, armed) ← if armMains then armMainInSource env relDisplay src else pure (src, false)
+        if armed then armedAny := true
         if let some p := dest.parent then IO.FS.createDirAll p
-        IO.FS.writeFile dest src
+        IO.FS.writeFile dest outSrc
       continue
     let res ← instrumentSource env relDisplay src nextId cfg
     nextId := res.nextSiteId
@@ -770,8 +960,10 @@ unsafe def instrumentTree (srcRoot outRoot : System.FilePath) (cfg : InstrumentC
     if let some why := res.skippedReason then
       skipped := skipped.push (relDisplay, why)
     unless cfg.analyzeOnly do
+      let (outSrc, armed) ← if armMains then armMainInSource env relDisplay res.instrumented else pure (res.instrumented, false)
+      if armed then armedAny := true
       if let some p := dest.parent then IO.FS.createDirAll p
-      IO.FS.writeFile dest res.instrumented
-  return { version := 1, sites := allSites, functions := allFuncs, skippedFiles := skipped }
+      IO.FS.writeFile dest outSrc
+  return { version := 1, armOnMain := armedAny, sites := allSites, functions := allFuncs, skippedFiles := skipped }
 
 end LeanCov.Cov

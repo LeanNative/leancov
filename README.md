@@ -4,7 +4,8 @@ Source-level branch & line coverage, McCabe CRAP, SonarSource-style Cognitive Co
 
 Unlike C-level (`clang -fprofile-instr-generate`) coverage over Lean's generated C, `leancov` parses `.lean` files with Lean's own parser, injects minimal source-level probes into a staged out-of-tree copy, and records branch hits via a tiny POSIX C `mmap(MAP_SHARED)` runtime. That means:
 
-- **Zero C codegen noise** — no reference-counting reuse checks (`isShared`), monad bind plumbing, boxed trampolines, or inlined-away functions.
+- **Zero C codegen noise & zero startup inflation** — no reference-counting reuse checks (`isShared`), monad bind plumbing, boxed trampolines, or inlined-away functions; pure 0-arg constants/CAFs are excluded, `leancov stage` arms `def main` with `LEAN_COV_DEFER_INIT=1` so module initializers produce 0.0% startup coverage, and `@[never_extract]` prevents Lean's compiler from hoisting constant-returning probes into `lean_once_cell_t` caches.
+- **Strict branch vs. function separation** — top-level branch coverage and LCOV `BRDA`/`BRF`/`BRH` count only genuine control-flow and boolean-operand outcomes (including `for`/`while` 0-iteration `loop.skip` and terminal `&&`/`||` RHS operands), never straight-line `fn.entry` probes.
 - **Crash- and `SIGKILL`-safe counters** — atomic 64-bit increments directly into a shared memory-mapped `.cov` file survive panics, multi-process tests, and killed child processes.
 - **No `Lean` runtime dependency in tested binaries** — `LeanCov.Runtime` has zero `Lean` imports, and `LeanCov.DoSyntax` uses `public meta import Lean` so instrumented executables link cleanly without `supportInterpreter := true`.
 - **Kernel & recursion compatible** — probes elaborate eagerly preserving `expectedType?`, metavariable order, `let mut`/`return`/`continue`/`break`, `Prop` erasure, `termination_by`, and structural recursion (`brecOn`).
@@ -75,11 +76,11 @@ leancov run \
   --profile build/leancov-stage/my-tests.cov \
   -- build/leancov-stage/.lake/build/bin/my-tests
 
-# Print CRAP + Cognitive CRAP report and export JSON / LCOV
+# Print CRAP + Cognitive CRAP report (with per-file and per-branch-kind breakdown) and export JSON / LCOV
 leancov report \
   --sites build/leancov-stage/sites.json \
   --profile build/leancov-stage/my-tests.cov \
-  --sort cog --files --top 25 \
+  --sort cog --files --kinds --top 25 \
   --json build/leancov-stage/coverage.json \
   --lcov build/leancov-stage/lcov.info
 ```
@@ -157,15 +158,16 @@ def main (args : List String) : IO UInt32 :=
 | `unless c do body` | `unless.enter`, `unless.skip` |
 | `match` / pattern equations / `doMatch` | `match.arm` per arm |
 | `let p := e \| fallback` & `let p ← act \| fallback` | `letElse.ok`, `letElse.fail` |
-| `for`, `while`, `repeat` | `loop.body` |
+| `for`, `while` / `repeat` | `loop.body` + `loop.skip` (0 iterations) / `loop.body` |
 | `try ... catch` | `catch.body` |
-| `a && b`, `a \|\| b` (disable with `--no-bool-ops`) | `and.true`/`and.false`, `or.true`/`or.false` |
-| Straight-line functions (0 branches) | `fn.entry` |
+| `a && b`, `a \|\| b` (disable with `--no-bool-ops`) | `and.true`/`and.false`, `or.true`/`or.false` on every atomic operand (both LHS and RHS) |
+| Callable straight-line functions (0 branches, excludes pure 0-arg constants) | `fn.entry` (counted in function & line coverage, excluded from branch coverage) |
 
 ## Runtime Environment Variables
 
 - `LEAN_COV_FILE` — path to the binary `.cov` file (`%p` expands to the process PID; without `%p`, parent and child processes share one file atomically).
 - `LEAN_COV_SITES` — site count used if the runtime initializes a new `.cov` file directly.
+- `LEAN_COV_DEFER_INIT` — when `1` (set automatically by `leancov run` when `sites.json` has `armOnMain: true`), suppresses hits fired during module initialization until `LeanCov.arm ()` runs at `main` entry.
 
 When `LEAN_COV_FILE` is unset, every probe is a single null-pointer check.
 

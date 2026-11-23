@@ -23,10 +23,10 @@ Usage:
                      [--src-dir <relDir>]... [--sites <sites.json>] [--append-sites]
                      [--prefix <relPrefix>] [--dep <name>=<path>]...
                      [--exclude <substr>]... [--imports <Mod1,Mod2>]... [--no-bool-ops] [--self]
-  leancov run        --sites <sites.json> --profile <out.cov> [--append] [--] <cmd> [args...]
+  leancov run        --sites <sites.json> --profile <out.cov> [--append] [--no-defer-init] [--] <cmd> [args...]
   leancov report     --sites <sites.json> (--profile <p.cov> | --profile-dir <dir>)...
                      [--json <out.json>] [--lcov <out.info>] [--top <N>]
-                     [--sort crap|cog|cc|uncov] [--files] [--missed]
+                     [--sort crap|cog|cc|uncov] [--files] [--kinds] [--missed]
                      [--min-cov <pct>] [--max-crap <val>] [--max-cog-crap <val>]
   leancov analyze    --src <dir> [--src ...] [--exclude <substr>]... [--imports <Mod1,Mod2>]...
                      [--json <out.json>] [--top <N>] [--sort cog|cc]
@@ -273,6 +273,32 @@ private def dirContainsLean (dir : System.FilePath) : IO Bool := do
   let fs ← collectLeanFiles dir
   return !fs.isEmpty
 
+private def dirHasMainLean (dir : System.FilePath) : IO Bool := do
+  for f in (← collectLeanFiles dir) do
+    let txt ← IO.FS.readFile f
+    if (txt.splitOn "main").length > 1 then return true
+  return false
+
+private partial def copyDirArmingMains (env : Environment) (srcDir dstDir : System.FilePath) : IO Bool := do
+  IO.FS.createDirAll dstDir
+  let mut armedAny := false
+  for entry in (← srcDir.readDir) do
+    let name := entry.fileName
+    if name == ".git" || name == ".lake" || name == "build" then continue
+    let sp := entry.path
+    let dp := dstDir / name
+    if ← sp.isDir then
+      let a ← copyDirArmingMains env sp dp
+      if a then armedAny := true
+    else if sp.extension == some "lean" then
+      let src ← IO.FS.readFile sp
+      let (outSrc, armed) ← armMainInSource env sp.toString src
+      if armed then armedAny := true
+      IO.FS.writeFile dp outSrc
+    else
+      IO.FS.writeBinFile dp (← IO.FS.readBinFile sp)
+  return armedAny
+
 /-- Run `leancov stage`: create a clean out-of-tree instrumented copy of any Lake package. -/
 private unsafe def cmdStage (args : List String) : IO UInt32 := do
   let mut pkgDir : System.FilePath := "."
@@ -347,6 +373,9 @@ private unsafe def cmdStage (args : List String) : IO UInt32 := do
         toInstrument := toInstrument.push name
     toInstrument := toInstrument.qsort (· < ·)
 
+  let env ← loadParserEnv cfg.extraImports
+  let mut armedAny : Bool := false
+
   -- Stage non-source top-level entries
   for entry in (← pkgAbs.readDir) do
     let name := entry.fileName
@@ -366,9 +395,14 @@ private unsafe def cmdStage (args : List String) : IO UInt32 := do
       -- Will be instrumented below
       let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dstPath.toString] }
     else if ← srcPath.isDir then
-      forceSymlink srcPath dstPath
+      if ← dirHasMainLean srcPath then
+        let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dstPath.toString] }
+        let a ← copyDirArmingMains env srcPath dstPath
+        if a then armedAny := true
+      else
+        forceSymlink srcPath dstPath
     else if srcPath.extension == some "lean" then
-      -- Top-level `.lean` file (e.g. `Main.lean`): instrument directly below
+      -- Top-level `.lean` file (e.g. `Main.lean`): instrument/arm directly below
       pure ()
     else
       let bytes ← IO.FS.readBinFile srcPath
@@ -383,7 +417,6 @@ private unsafe def cmdStage (args : List String) : IO UInt32 := do
       forceSymlink entry.path (stageDepsDir / entry.fileName)
 
   -- Instrument source directories and top-level `.lean` files
-  let env ← loadParserEnv cfg.extraImports
   let mut nextId : Nat := 0
   let mut allSites : Array Site := #[]
   let mut allFuncs : Array FuncInfo := #[]
@@ -394,16 +427,18 @@ private unsafe def cmdStage (args : List String) : IO UInt32 := do
     allSites := prev.sites
     allFuncs := prev.functions
     allSkipped := prev.skippedFiles
+    if prev.armOnMain then armedAny := true
 
   for dirName in toInstrument do
     let dispPfx := if pathPrefix.isEmpty then dirName else s!"{pathPrefix}/{dirName}"
-    let m ← instrumentTree (pkgAbs / dirName) (stageAbs / dirName) cfg nextId dispPfx
+    let m ← instrumentTree (pkgAbs / dirName) (stageAbs / dirName) cfg nextId dispPfx (armMains := true)
     nextId := nextId + m.sites.size
     allSites := allSites ++ m.sites
     allFuncs := allFuncs ++ m.functions
     allSkipped := allSkipped ++ m.skippedFiles
+    if m.armOnMain then armedAny := true
 
-  -- Instrument any top-level `.lean` files (excluding `lakefile.lean`)
+  -- Instrument any top-level `.lean` files (excluding `lakefile.lean`), arming `def main` even when excluded
   for entry in (← pkgAbs.readDir) do
     let name := entry.fileName
     if name == "lakefile.lean" then continue
@@ -413,7 +448,9 @@ private unsafe def cmdStage (args : List String) : IO UInt32 := do
       let dispName := if pathPrefix.isEmpty then name else s!"{pathPrefix}/{name}"
       let excl := cfg.exclude.any fun pat => !pat.isEmpty && ((name.splitOn pat).length > 1 || (dispName.splitOn pat).length > 1)
       if excl then
-        IO.FS.writeFile (stageAbs / name) src
+        let (outSrc, armed) ← armMainInSource env dispName src
+        if armed then armedAny := true
+        IO.FS.writeFile (stageAbs / name) outSrc
       else
         let res ← instrumentSource env dispName src nextId cfg
         nextId := res.nextSiteId
@@ -421,9 +458,13 @@ private unsafe def cmdStage (args : List String) : IO UInt32 := do
         allFuncs := allFuncs ++ res.functions
         if let some why := res.skippedReason then
           allSkipped := allSkipped.push (dispName, why)
-        IO.FS.writeFile (stageAbs / name) res.instrumented
+        let (outSrc, armed) ← armMainInSource env dispName res.instrumented
+        if armed then armedAny := true
+        IO.FS.writeFile (stageAbs / name) outSrc
 
-  let manifest : Manifest := { version := 1, sites := allSites, functions := allFuncs, skippedFiles := allSkipped }
+  let manifest : Manifest := {
+    version := 1, armOnMain := armedAny, sites := allSites, functions := allFuncs, skippedFiles := allSkipped
+  }
   writeManifest sitesOut manifest
   IO.println s!"Staged {pkgAbs} -> {stageAbs}"
   IO.println s!"  Instrumented dirs: {", ".intercalate toInstrument.toList}"
@@ -439,6 +480,7 @@ private def cmdRun (args : List String) : IO UInt32 := do
   let mut sitesPath : Option System.FilePath := none
   let mut profilePath : Option System.FilePath := none
   let mut appendMode : Bool := false
+  let mut noDeferInit : Bool := false
   let mut cmdArgs : List String := []
   let mut rest := args
   while !rest.isEmpty do
@@ -446,6 +488,7 @@ private def cmdRun (args : List String) : IO UInt32 := do
     | "--sites" :: v :: tl => sitesPath := some ⟨v⟩; rest := tl
     | "--profile" :: v :: tl => profilePath := some ⟨v⟩; rest := tl
     | "--append" :: tl => appendMode := true; rest := tl
+    | "--no-defer-init" :: tl => noDeferInit := true; rest := tl
     | "--" :: tl => cmdArgs := tl; break
     | tok :: tl =>
       if tok.startsWith "--" then
@@ -466,13 +509,16 @@ private def cmdRun (args : List String) : IO UInt32 := do
       initProfile profAbs siteCount
   else if let some parent := profAbs.parent then
     IO.FS.createDirAll parent
+  let mut envVars : Array (String × Option String) := #[
+    ("LEAN_COV_FILE", some profAbs.toString),
+    ("LEAN_COV_SITES", some (toString siteCount))
+  ]
+  if m.armOnMain && !noDeferInit then
+    envVars := envVars.push ("LEAN_COV_DEFER_INIT", some "1")
   let child ← IO.Process.spawn {
     cmd := cmd
     args := cargs.toArray
-    env := #[
-      ("LEAN_COV_FILE", some profAbs.toString),
-      ("LEAN_COV_SITES", some (toString siteCount))
-    ]
+    env := envVars
     stdin := .inherit
     stdout := .inherit
     stderr := .inherit
@@ -498,6 +544,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
   let mut topN : Nat := 25
   let mut sortBy : SortKey := .crap
   let mut showFiles : Bool := false
+  let mut showKinds : Bool := false
   let mut showMissed : Bool := false
   let mut minCov : Option Float := none
   let mut maxCrap : Option Float := none
@@ -520,6 +567,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
       | some k => sortBy := k; rest := tl
       | none => IO.eprintln s!"invalid --sort value: {v} (use crap|cog|cc|uncov)"; return 2
     | "--files" :: tl => showFiles := true; rest := tl
+    | "--kinds" :: tl => showKinds := true; rest := tl
     | "--missed" :: tl => showMissed := true; rest := tl
     | "--min-cov" :: v :: tl =>
       match parseFloat? v with
@@ -544,7 +592,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
   let m ← readManifest sp
   let hits ← mergeProfiles profiles m.sites.size
   let rep := buildReport m hits
-  IO.println (formatReport rep topN sortBy showFiles showMissed)
+  IO.println (formatReport rep topN sortBy showFiles showMissed showKinds)
   if let some jp := jsonOut then
     if let some p := jp.parent then IO.FS.createDirAll p
     IO.FS.writeFile jp (toJson rep).pretty
@@ -634,6 +682,3 @@ unsafe def runCLI (args : List String) : IO UInt32 := do
     return 2
 
 end LeanCov.CLI
-
-unsafe def main (args : List String) : IO UInt32 :=
-  LeanCov.CLI.runCLI args

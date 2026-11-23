@@ -15,6 +15,7 @@
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static uint64_t *g_hits = NULL;
 static size_t g_site_count = 0;
+static int g_armed = 1;
 
 static void leancov_expand_path(const char *tmpl, char *out, size_t out_sz) {
     size_t j = 0;
@@ -33,6 +34,11 @@ static void leancov_expand_path(const char *tmpl, char *out, size_t out_sz) {
 }
 
 static void leancov_init_impl(void) {
+    const char *defer_env = getenv("LEAN_COV_DEFER_INIT");
+    if (defer_env && defer_env[0] == '1' && defer_env[1] == '\0') {
+        __atomic_store_n(&g_armed, 0, __ATOMIC_RELEASE);
+    }
+
     const char *path_env = getenv("LEAN_COV_FILE");
     if (!path_env || path_env[0] == '\0') {
         return;
@@ -104,9 +110,16 @@ static void leancov_init_impl(void) {
 
 static inline void leancov_bump(size_t site) {
     pthread_once(&g_init_once, leancov_init_impl);
-    if (g_hits && site < g_site_count) {
+    if (__atomic_load_n(&g_armed, __ATOMIC_ACQUIRE) && g_hits && site < g_site_count) {
         __atomic_fetch_add(&g_hits[site], 1, __ATOMIC_RELAXED);
     }
+}
+
+LEAN_EXPORT lean_object *leancov_arm(lean_object *unit) {
+    (void)unit;
+    pthread_once(&g_init_once, leancov_init_impl);
+    __atomic_store_n(&g_armed, 1, __ATOMIC_RELEASE);
+    return lean_io_result_mk_ok(lean_box(0));
 }
 
 LEAN_EXPORT lean_object *leancov_hit(size_t site, lean_object *f) {
