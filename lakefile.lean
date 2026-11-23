@@ -34,6 +34,10 @@ lean_exe «leancov-rt-test» where
   srcDir := "."
   root := `Tests.RuntimeTest
 
+lean_exe «leancov-fuzz-test» where
+  srcDir := "."
+  root := `Tests.FuzzTest
+
 lean_exe «leancov-test» where
   srcDir := "."
   root := `Tests.SelfTest

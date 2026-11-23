@@ -282,7 +282,141 @@ private def skipWalkKind (k : SyntaxNodeKind) : Bool :=
   k == `Lean.Parser.Term.stxQuot ||
   k == `Lean.Parser.Term.dynamicQuot
 
-/-- Walk an executable expression / `do` block and record source-level branch probes. -/
+mutual
+
+private partial def walkTermIf (k : SyntaxNodeKind) (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  let n := args.size
+  unless n ≥ 6 do
+    for a in args do walkBody a nesting
+    return
+  let savedBool := (← get).instrumentBoolOps
+  if k == `termDepIfThenElse then
+    modify fun s => { s with instrumentBoolOps := false }
+  walkBody args[n - 5]! nesting
+  if k == `termDepIfThenElse then
+    modify fun s => { s with instrumentBoolOps := savedBool }
+  let thenStx := args[n - 3]!
+  let elseStx := args[n - 1]!
+  emitTermWrap thenStx .ifThen nesting
+  walkBody thenStx (nesting + 1)
+  if elseStx.getKind == `termIfThenElse || elseStx.getKind == `termDepIfThenElse || elseStx.getKind == `termIfLet then
+    walkBody elseStx nesting
+  else
+    emitTermWrap elseStx .ifElse nesting
+    walkBody elseStx (nesting + 1)
+
+private partial def walkDoIf (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  unless args.size ≥ 6 do
+    for a in args do walkBody a nesting
+    return
+  walkBody args[1]! nesting
+  let thenSeq := args[3]!
+  let elseIfs := args[4]!.getArgs
+  let elseOpt := args[5]!
+  let hasElse := elseOpt.getNumArgs ≥ 2
+  if !hasElse && elseIfs.isEmpty then
+    emitOneArmedDoIfBranch args[0]! thenSeq nesting
+    walkBody thenSeq (nesting + 1)
+    return
+  emitDoProbe_ thenSeq .ifThen nesting
+  walkBody thenSeq (nesting + 1)
+  for idx in [:elseIfs.size] do
+    let ei := elseIfs[idx]!
+    if ei.getNumArgs ≥ 4 then
+      walkBody (ei.getArg 1) nesting
+      let eiSeq := ei.getArg 3
+      if !hasElse && idx + 1 == elseIfs.size then
+        emitOneArmedDoIfBranch ei eiSeq nesting
+      else
+        emitDoProbe_ eiSeq .ifThen nesting
+      walkBody eiSeq (nesting + 1)
+  if hasElse then
+    let elseSeq := elseOpt.getArg 1
+    emitDoProbe_ elseSeq .ifElse nesting
+    walkBody elseSeq (nesting + 1)
+
+private partial def walkDoUnless (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  unless args.size ≥ 4 do
+    for a in args do walkBody a nesting
+    return
+  let uTok := args[0]!
+  let cond := args[1]!
+  let doTok := args[2]!
+  let bodySeq := args[3]!
+  let (some ua, some ub, some da, some db, some ba, some bb) :=
+    (uTok.getPos?, uTok.getTailPos?, doTok.getPos?, doTok.getTailPos?, bodySeq.getPos?, bodySeq.getTailPos?)
+    | for a in args do walkBody a nesting
+      return
+  let skipId ← allocSite ua .unlessSkip nesting
+  let enterId ← allocSite ba .unlessEnter nesting
+  addReplace ua.byteIdx (ub.byteIdx - ua.byteIdx) "if"
+  walkBody cond nesting
+  if bodySeq.getKind == `Lean.Parser.Term.doSeqBracketed then
+    addReplace da.byteIdx (db.byteIdx - da.byteIdx) s!"then \{ leancov_hit% {skipId}; pure () } else"
+    if let some (ia, ib) := firstDoItemSpan? bodySeq then
+      if ← isLineStart ia.byteIdx then
+        let icol ← colOf ia
+        addWrap ia.byteIdx ib.byteIdx s!"leancov_hit% {enterId};\n{spaces icol}"
+      else
+        addWrap ia.byteIdx ib.byteIdx s!"leancov_hit% {enterId}; "
+  else if ← isLineStart ba.byteIdx then
+    let col ← colOf ba
+    addReplace da.byteIdx (db.byteIdx - da.byteIdx) s!"then \{ leancov_hit% {skipId}; pure () } else"
+    addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {enterId};\n{spaces col}"
+  else
+    addReplace da.byteIdx (db.byteIdx - da.byteIdx) s!"then \{ leancov_hit% {skipId}; pure () } else \{"
+    addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {enterId}; " " }"
+    if (← lineOf ba) != (← lineOf bb) then
+      addSemisBetweenDoItems bodySeq
+  walkBody bodySeq (nesting + 1)
+
+private partial def walkDoLoop (stx : Syntax) (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  for i in [:args.size] do
+    let a := args[i]!
+    if i + 1 < args.size then
+      walkBody a nesting
+      continue
+    let trackSkip ← match stx.getPos?, stx.getTailPos? with
+      | some la, some _ => isLineStart la.byteIdx
+      | _, _ => pure false
+    match trackSkip, firstDoItemSpan? a, stx.getPos?, stx.getTailPos? with
+    | true, some (ba, bb), some la, some lb =>
+      let bodyId ← allocSite ba .loopBody nesting
+      let skipId ← allocSite la .loopSkip nesting
+      let lcol ← colOf la
+      let flag := s!"__lc_loop_{bodyId}"
+      addWrap la.byteIdx lb.byteIdx
+        s!"let mut {flag} := false;\n{spaces lcol}"
+        s!"\n{spaces lcol}if !{flag} then \{ leancov_hit% {skipId}; pure PUnit.unit };"
+      if ← isLineStart ba.byteIdx then
+        let bcol ← colOf ba
+        addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
+      else if a.getKind == `Lean.Parser.Term.doSeqBracketed then
+        addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId}; {flag} := true; "
+      else if (← lineOf ba) != (← lineOf bb) then
+        let bcol ← colOf ba
+        addWrap ba.byteIdx bb.byteIdx s!"\n{spaces bcol}leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
+      else
+        addWrap ba.byteIdx bb.byteIdx s!"\{ leancov_hit% {bodyId}; {flag} := true; " " }"
+    | _, _, _, _ =>
+      emitDoProbe_ a .loopBody nesting
+    walkBody a (nesting + 1)
+
+private partial def walkDoPatDecl (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  if args.size ≥ 4 then walkBody args[3]! nesting
+  if args.size ≥ 5 then
+    let fb := args[4]!
+    if fb.getNumArgs ≥ 2 then
+      let fallbackSeq := fb.getArg 1
+      emitDoProbe_ fallbackSeq .letElseFail nesting
+      walkBody fallbackSeq (nesting + 1)
+      if fb.getNumArgs ≥ 3 then
+        let contOpt := fb.getArg 2
+        if contOpt.getNumArgs ≥ 1 then
+          let contSeq := contOpt.getArg 0
+          emitDoProbe_ contSeq .letElseOk nesting
+          walkBody contSeq nesting
+
 private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
   match stx with
   | .missing | .atom .. | .ident .. => pure ()
@@ -290,35 +424,10 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
     if skipWalkKind k then return
     match k with
     | `Lean.Parser.Term.typeAscription =>
-      -- `(e : T)`: walk `e`, never `T`
       if args.size ≥ 2 then walkBody args[1]! nesting
     | `termIfThenElse | `termDepIfThenElse | `termIfLet =>
-      let n := args.size
-      if n ≥ 6 then
-        -- Avoid wrapping `&&`/`||` inside a dependent `if h : c` condition so proof `h` stays syntactically clean
-        let savedBool := (← get).instrumentBoolOps
-        if k == `termDepIfThenElse then
-          modify fun s => { s with instrumentBoolOps := false }
-        if k == `termIfLet then
-          -- #[if, let, pat, :=, scrutinee, then, t, else, e]
-          if n ≥ 5 then walkBody args[n - 5]! nesting
-        else
-          if n ≥ 5 then walkBody args[n - 5]! nesting
-        if k == `termDepIfThenElse then
-          modify fun s => { s with instrumentBoolOps := savedBool }
-        let thenStx := args[n - 3]!
-        let elseStx := args[n - 1]!
-        emitTermWrap thenStx .ifThen nesting
-        walkBody thenStx (nesting + 1)
-        if elseStx.getKind == `termIfThenElse || elseStx.getKind == `termDepIfThenElse || elseStx.getKind == `termIfLet then
-          walkBody elseStx nesting
-        else
-          emitTermWrap elseStx .ifElse nesting
-          walkBody elseStx (nesting + 1)
-      else
-        for a in args do walkBody a nesting
+      walkTermIf k args nesting
     | `Lean.Parser.Term.doIfProp =>
-      -- #[optIdentColon, cond]: if `h :` is present, keep `cond` syntactically untouched for proof `h`
       if args.size ≥ 2 then
         let hasProofBinder := args[0]!.getNumArgs > 0
         let savedBool := (← get).instrumentBoolOps
@@ -326,79 +435,12 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
         walkBody args[1]! nesting
         if hasProofBinder then modify fun s => { s with instrumentBoolOps := savedBool }
     | `Lean.Parser.Term.doIfLet =>
-      -- #[let, pat, doIfLetPure/Bind]: only walk the scrutinee, not `pat`
       if args.size ≥ 3 then walkBody args[2]! nesting
     | `Lean.Parser.Term.doIf =>
-      -- #[atom("if"), cond, atom("then"), thenSeq, elseIfs, elseOpt]
-      if args.size ≥ 6 then
-        walkBody args[1]! nesting
-        let thenSeq := args[3]!
-        let elseIfs := args[4]!.getArgs
-        let elseOpt := args[5]!
-        let hasElse := elseOpt.getNumArgs ≥ 2
-        if !hasElse && elseIfs.isEmpty then
-          emitOneArmedDoIfBranch args[0]! thenSeq nesting
-          walkBody thenSeq (nesting + 1)
-        else
-          emitDoProbe_ thenSeq .ifThen nesting
-          walkBody thenSeq (nesting + 1)
-          for idx in [:elseIfs.size] do
-            let ei := elseIfs[idx]!
-            if ei.getNumArgs ≥ 4 then
-              walkBody (ei.getArg 1) nesting
-              let eiSeq := ei.getArg 3
-              let isLastWithoutElse := !hasElse && idx + 1 == elseIfs.size
-              if isLastWithoutElse then
-                emitOneArmedDoIfBranch ei eiSeq nesting
-                walkBody eiSeq (nesting + 1)
-              else
-                emitDoProbe_ eiSeq .ifThen nesting
-                walkBody eiSeq (nesting + 1)
-          if hasElse then
-            let elseSeq := elseOpt.getArg 1
-            emitDoProbe_ elseSeq .ifElse nesting
-            walkBody elseSeq (nesting + 1)
-      else
-        for a in args do walkBody a nesting
+      walkDoIf args nesting
     | `Lean.Parser.Term.doUnless =>
-      -- #[atom("unless"), cond, atom("do"), bodySeq]
-      -- Rewrite `unless c do body` to `if c then { leancov_hit% skip; pure () } else ...`
-      if args.size ≥ 4 then
-        let uTok := args[0]!
-        let cond := args[1]!
-        let doTok := args[2]!
-        let bodySeq := args[3]!
-        if let (some ua, some ub, some da, some db, some ba, some bb) :=
-            (uTok.getPos?, uTok.getTailPos?, doTok.getPos?, doTok.getTailPos?, bodySeq.getPos?, bodySeq.getTailPos?) then
-          let skipId ← allocSite ua .unlessSkip nesting
-          let enterId ← allocSite ba .unlessEnter nesting
-          addReplace ua.byteIdx (ub.byteIdx - ua.byteIdx) "if"
-          walkBody cond nesting
-          if bodySeq.getKind == `Lean.Parser.Term.doSeqBracketed then
-            addReplace da.byteIdx (db.byteIdx - da.byteIdx) s!"then \{ leancov_hit% {skipId}; pure () } else"
-            if let some (ia, ib) := firstDoItemSpan? bodySeq then
-              if ← isLineStart ia.byteIdx then
-                let icol ← colOf ia
-                addWrap ia.byteIdx ib.byteIdx s!"leancov_hit% {enterId};\n{spaces icol}"
-              else
-                addWrap ia.byteIdx ib.byteIdx s!"leancov_hit% {enterId}; "
-          else if ← isLineStart ba.byteIdx then
-            -- Multi-line or next-line indented body: keep native `doSeqIndent` with zero braces!
-            let col ← colOf ba
-            addReplace da.byteIdx (db.byteIdx - da.byteIdx) s!"then \{ leancov_hit% {skipId}; pure () } else"
-            addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {enterId};\n{spaces col}"
-          else
-            addReplace da.byteIdx (db.byteIdx - da.byteIdx) s!"then \{ leancov_hit% {skipId}; pure () } else \{"
-            addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {enterId}; " " }"
-            if (← lineOf ba) != (← lineOf bb) then
-              addSemisBetweenDoItems bodySeq
-          walkBody bodySeq (nesting + 1)
-        else
-          for a in args do walkBody a nesting
-      else
-        for a in args do walkBody a nesting
+      walkDoUnless args nesting
     | `Lean.Parser.Term.doLetElse =>
-      -- #[let, mut?, letConfig, pat, :=, val, |, fallbackSeq, contOpt]
       if args.size ≥ 6 then walkBody args[5]! nesting
       if args.size ≥ 8 then
         emitDoProbe_ args[7]! .letElseFail nesting
@@ -410,40 +452,7 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
           emitDoProbe_ contSeq .letElseOk nesting
           walkBody contSeq nesting
     | `Lean.Parser.Term.doFor | `Lean.Parser.Term.doWhile =>
-      for i in [:args.size] do
-        let a := args[i]!
-        if i + 1 == args.size then
-          -- When the loop starts its own line in a `doSeq`, track 0-iteration skips with a pure
-          -- lexical `let mut` flag (works uniformly across Id, StateT, ReaderT, IO, and `while ←`).
-          let trackSkip ← match stx.getPos?, stx.getTailPos? with
-            | some la, some _ => isLineStart la.byteIdx
-            | _, _ => pure false
-          if trackSkip then
-            if let (some (ba, bb), some la, some lb) := (firstDoItemSpan? a, stx.getPos?, stx.getTailPos?) then
-              let bodyId ← allocSite ba .loopBody nesting
-              let skipId ← allocSite la .loopSkip nesting
-              let lcol ← colOf la
-              let flag := s!"__lc_loop_{bodyId}"
-              addWrap la.byteIdx lb.byteIdx
-                s!"let mut {flag} := false;\n{spaces lcol}"
-                s!"\n{spaces lcol}if !{flag} then \{ leancov_hit% {skipId}; pure PUnit.unit };"
-              if ← isLineStart ba.byteIdx then
-                let bcol ← colOf ba
-                addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
-              else if a.getKind == `Lean.Parser.Term.doSeqBracketed then
-                addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId}; {flag} := true; "
-              else if (← lineOf ba) != (← lineOf bb) then
-                let bcol ← colOf ba
-                addWrap ba.byteIdx bb.byteIdx s!"\n{spaces bcol}leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
-              else
-                addWrap ba.byteIdx bb.byteIdx s!"\{ leancov_hit% {bodyId}; {flag} := true; " " }"
-            else
-              emitDoProbe_ a .loopBody nesting
-          else
-            emitDoProbe_ a .loopBody nesting
-          walkBody a (nesting + 1)
-        else
-          walkBody a nesting
+      walkDoLoop stx args nesting
     | `Lean.Parser.Term.doRepeat =>
       for i in [:args.size] do
         let a := args[i]!
@@ -458,13 +467,10 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
         emitDoProbe_ body .catchBody nesting
         walkBody body (nesting + 1)
     | `Lean.Parser.Term.matchAlt =>
-      -- #[atom("|"), pats, atom("=>"), rhs]
       if args.size ≥ 4 then
         let rhs := args[3]!
-        if isDoSeq rhs then
-          emitDoProbe_ rhs .matchArm nesting
-        else
-          emitTermWrap rhs .matchArm nesting
+        if isDoSeq rhs then emitDoProbe_ rhs .matchArm nesting
+        else emitTermWrap rhs .matchArm nesting
         walkBody rhs (nesting + 1)
     | `«term_&&_» | `«term_||_» =>
       if args.size ≥ 3 then
@@ -478,44 +484,18 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
         walkBody args[2]! nesting
       else
         for a in args do walkBody a nesting
-    | `Lean.Parser.Term.letDecl =>
-      -- Don't instrument binder/type annotations in `let x : T := v`
-      for a in args do walkBody a nesting
-    | `Lean.Parser.Term.letIdDecl =>
-      -- #[letId, binders, typeSpecOpt, ":=", val]
+    | `Lean.Parser.Term.letIdDecl | `Lean.Parser.Term.letPatDecl =>
       if args.size ≥ 5 then walkBody args[4]! nesting
-    | `Lean.Parser.Term.letPatDecl =>
-      -- #[pat, optPats, typeSpecOpt, ":=", val]
-      if args.size ≥ 5 then walkBody args[4]! nesting
-    | `Lean.Parser.Term.doLet =>
-      -- #[let, ..., letDecl]
-      for a in args do walkBody a nesting
-    | `Lean.Parser.Term.doLetArrow =>
-      -- #[let, mut?, letDecl]
-      for a in args do walkBody a nesting
     | `Lean.Parser.Term.doIdDecl =>
-      -- #[ident, typeSpecOpt, "←", val]
       if args.size ≥ 4 then walkBody args[3]! nesting
     | `Lean.Parser.Term.doPatDecl =>
-      -- #[pat, typeSpecOpt, "←", val, fallbackOpt]
-      if args.size ≥ 4 then walkBody args[3]! nesting
-      if args.size ≥ 5 then
-        let fb := args[4]!
-        if fb.getNumArgs ≥ 2 then
-          let fallbackSeq := fb.getArg 1
-          emitDoProbe_ fallbackSeq .letElseFail nesting
-          walkBody fallbackSeq (nesting + 1)
-          if fb.getNumArgs ≥ 3 then
-            let contOpt := fb.getArg 2
-            if contOpt.getNumArgs ≥ 1 then
-              let contSeq := contOpt.getArg 0
-              emitDoProbe_ contSeq .letElseOk nesting
-              walkBody contSeq nesting
+      walkDoPatDecl args nesting
     | `Lean.Parser.Term.structInstField =>
-      -- `field := val` (skip the field name, instrument only `val`)
       if args.size ≥ 2 then walkBody args[args.size - 1]! nesting
     | _ =>
       for a in args do walkBody a nesting
+
+end
 
 /-- Detect modifiers that mean a declaration is compile-time/proof/extern only and should not be instrumented. -/
 private def shouldSkipModifiers (mods : Syntax) (src : String) : Bool :=

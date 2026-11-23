@@ -455,6 +455,43 @@ private def testFuzzPrimitives : TM Unit := do
   LeanCov.Fuzz.require true "ok"
   check "Fuzz.require throws on false" (← catchesIO (LeanCov.Fuzz.require false "boom"))
 
+  -- End-to-end `Fuzz.main` supervisor + child + corpus replay + finding + bad option
+  let fuzzBin := ((← IO.appPath).parent.getD ".lake/build/bin") / "leancov-fuzz-test"
+  if ← fuzzBin.pathExists then
+    let fdir : System.FilePath := ".lake/build/tmp_fuzz_e2e"
+    let _ ← IO.Process.output { cmd := "rm", args := #["-rf", fdir.toString] }
+    IO.FS.createDirAll (fdir / "corpus" / "clean")
+    IO.FS.writeBinFile (fdir / "corpus" / "clean" / "seed1.bin") "abc".toUTF8
+    IO.FS.writeFile (fdir / "corpus" / "clean" / "README.txt") "ignored"
+    -- 1. Clean run with corpus replay (and ignored non-.bin file)
+    let okOut ← IO.Process.output {
+      cmd := fuzzBin.toString
+      args := #["--target", "clean", "--iterations", "50", "--seed", "0x42", "--max-input", "64"]
+      env := #[("LEANCOV_TEST_CORPUS", some (fdir / "corpus").toString)]
+    }
+    check "fuzz clean + corpus passes" (okOut.exitCode == 0) s!"{okOut.stdout}{okOut.stderr}"
+    -- 2. Finding caught & saved (with decimal seed)
+    let findOut ← IO.Process.output {
+      cmd := fuzzBin.toString
+      args := #["--target", "finding", "--iterations", "50", "--seed", "66", "--save", (fdir / "saved").toString]
+    }
+    checkEq "fuzz finding exits 1" findOut.exitCode 1
+    check "fuzz finding saved .bin" (← (fdir / "saved" / "finding-0x42.bin").pathExists)
+    -- 3. Unparseable seeds exit 1
+    let noSeedOut ← IO.Process.output {
+      cmd := fuzzBin.toString
+      args := #["--target", "noseed", "--iterations", "5"]
+    }
+    checkEq "fuzz noseed exits 1" noSeedOut.exitCode 1
+    -- 4. Invalid CLI options exit 2 (fast: checked before spawning child)
+    for badArgs in #[#["--bogus"], #["--iterations", "nope"], #["--seed", "0xZZ"], #["--max-input", "abc"]] do
+      let badOut ← IO.Process.output { cmd := fuzzBin.toString, args := badArgs }
+      checkEq s!"fuzz bad option {badArgs} exits 2" badOut.exitCode 2
+    -- 5. Unknown target exits 2
+    let unkOut ← IO.Process.output { cmd := fuzzBin.toString, args := #["--target", "doesnotexist", "--iterations", "1"] }
+    checkEq "fuzz unknown target exits 2" unkOut.exitCode 2
+    let _ ← IO.Process.output { cmd := "rm", args := #["-rf", fdir.toString] }
+
 /-- End-to-end ground-truth verification: stage, build, and execute a real binary, then assert
 EXACT per-site hit counts in the binary `.cov` file for:
 1. zero startup hits from a CAF calling an instrumented helper (`LEAN_COV_DEFER_INIT=1`),
