@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Lean via elan
+        shell: bash
+        run: |
+          TOOLCHAIN="$(tr -d '[:space:]' < lean-toolchain)"
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf \
+            | sh -s -- -y --default-toolchain "$TOOLCHAIN"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        run: |
+          lean --version
+          lake --version
+
+      - name: Build
+        run: lake build leancov leancov-rt-test leancov-test leancov-fuzz-test
+
+      - name: Run test suites
+        run: |
+          .lake/build/bin/leancov --version
+          .lake/build/bin/leancov-rt-test
+          .lake/build/bin/leancov-test
+
+      - name: Self-coverage dogfood pass
+        run: |
+          rm -rf build/self-stage
+          .lake/build/bin/leancov stage \
+            --pkg . \
+            --out build/self-stage \
+            --self \
+            --src-dir LeanCov \
+            --exclude Runtime.lean \
+            --exclude DoSyntax.lean \
+            --exclude Main.lean
+          (cd build/self-stage && lake build leancov leancov-rt-test leancov-fuzz-test leancov-test)
+          .lake/build/bin/leancov run \
+            --sites build/self-stage/sites.json \
+            --profile build/self-stage/self.cov \
+            -- build/self-stage/.lake/build/bin/leancov-rt-test
+          .lake/build/bin/leancov run \
+            --sites build/self-stage/sites.json \
+            --profile build/self-stage/self.cov \
+            --append \
+            -- build/self-stage/.lake/build/bin/leancov-test
+          .lake/build/bin/leancov report \
+            --sites build/self-stage/sites.json \
+            --profile build/self-stage/self.cov \
+            --files --kinds --sort cog --top 10
+          rm -rf build/self-stage

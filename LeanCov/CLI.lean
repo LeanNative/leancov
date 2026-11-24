@@ -13,6 +13,9 @@ Subcommands:
 namespace LeanCov.CLI
 open Lean LeanCov.Cov
 
+/-- Package version printed by `leancov --version` / `-V`. -/
+def version : String := "0.1.0"
+
 private def usage : String :=
 "leancov — source-level Lean 4 coverage, McCabe CRAP, and Cognitive Complexity
 
@@ -30,6 +33,8 @@ Usage:
                      [--min-cov <pct>] [--max-crap <val>] [--max-cog-crap <val>]
   leancov analyze    --src <dir> [--src ...] [--exclude <substr>]... [--imports <Mod1,Mod2>]...
                      [--json <out.json>] [--top <N>] [--sort cog|cc]
+  leancov --version | -V
+  leancov --help | -h
 "
 
 private def parseFloat? (s : String) : Option Float :=
@@ -299,179 +304,219 @@ private partial def copyDirArmingMains (env : Environment) (srcDir dstDir : Syst
       IO.FS.writeBinFile dp (← IO.FS.readBinFile sp)
   return armedAny
 
-/-- Run `leancov stage`: create a clean out-of-tree instrumented copy of any Lake package. -/
-private unsafe def cmdStage (args : List String) : IO UInt32 := do
-  let mut pkgDir : System.FilePath := "."
-  let mut stageDir : Option System.FilePath := none
-  let mut leancovDir : Option System.FilePath := none
-  let mut srcDirs : Array String := #[]
-  let mut sitesPath : Option System.FilePath := none
-  let mut appendSites : Bool := false
-  let mut pathPrefix : String := ""
-  let mut depOverrides : Array (String × String) := #[]
-  let mut excludes : Array String := #[]
-  let mut extraImports : Array Name := #[]
-  let mut boolOps : Bool := true
-  let mut isSelf : Bool := false
-  let mut rest := args
-  while !rest.isEmpty do
-    match rest with
-    | "--pkg" :: v :: tl => pkgDir := ⟨v⟩; rest := tl
-    | "--out" :: v :: tl => stageDir := some ⟨v⟩; rest := tl
-    | "--leancov" :: v :: tl => leancovDir := some ⟨v⟩; rest := tl
-    | "--src-dir" :: v :: tl => srcDirs := srcDirs.push v; rest := tl
-    | "--sites" :: v :: tl => sitesPath := some ⟨v⟩; rest := tl
-    | "--append-sites" :: tl => appendSites := true; rest := tl
-    | "--prefix" :: v :: tl => pathPrefix := v; rest := tl
-    | "--dep" :: v :: tl =>
-      match parseDepOverride v with
-      | some (k, p) =>
-        let abs ← canonicalOrAbs ⟨p⟩
-        depOverrides := depOverrides.push (k, abs.toString)
-        rest := tl
-      | none => IO.eprintln s!"invalid --dep value (expected name=path): {v}"; return 2
-    | "--exclude" :: v :: tl => excludes := excludes.push v; rest := tl
-    | "--imports" :: v :: tl => extraImports := extraImports ++ splitImports v; rest := tl
-    | "--no-bool-ops" :: tl => boolOps := false; rest := tl
-    | "--self" :: tl => isSelf := true; rest := tl
-    | flag :: _ =>
-      IO.eprintln s!"unknown option for stage: {flag}"
-      return 2
-    | [] => break
-  let some outDir := stageDir | do
-    IO.eprintln "stage: --out <stageDir> is required"
-    return 2
-  let pkgAbs ← canonicalOrAbs pkgDir
-  IO.FS.createDirAll outDir
-  let stageAbs ← canonicalOrAbs outDir
-  let leancovAbs ← match leancovDir with
-    | some d => canonicalOrAbs d
-    | none =>
-      if isSelf then pure pkgAbs
-      else do
-        IO.eprintln "stage: --leancov <leancovDir> is required (or pass --self)"
-        return 2
-  if !isSelf && pkgAbs == leancovAbs then
-    isSelf := true
+private structure StageOpts where
+  pkgDir : System.FilePath := "."
+  stageDir : Option System.FilePath := none
+  leancovDir : Option System.FilePath := none
+  srcDirs : Array String := #[]
+  sitesPath : Option System.FilePath := none
+  appendSites : Bool := false
+  pathPrefix : String := ""
+  depOverrides : Array (String × String) := #[]
+  excludes : Array String := #[]
+  extraImports : Array Name := #[]
+  boolOps : Bool := true
+  isSelf : Bool := false
+  deriving Inhabited
 
-  let sitesOut := sitesPath.getD (stageAbs / "sites.json")
-  let cfg : InstrumentConfig := {
-    exclude := excludes
-    extraImports := extraImports
-    instrumentBoolOps := boolOps
-  }
+private def parseStageArgs : List String → StageOpts → Except String StageOpts
+  | [], o => pure o
+  | "--pkg" :: v :: tl, o => parseStageArgs tl { o with pkgDir := ⟨v⟩ }
+  | "--out" :: v :: tl, o => parseStageArgs tl { o with stageDir := some ⟨v⟩ }
+  | "--leancov" :: v :: tl, o => parseStageArgs tl { o with leancovDir := some ⟨v⟩ }
+  | "--src-dir" :: v :: tl, o => parseStageArgs tl { o with srcDirs := o.srcDirs.push v }
+  | "--sites" :: v :: tl, o => parseStageArgs tl { o with sitesPath := some ⟨v⟩ }
+  | "--append-sites" :: tl, o => parseStageArgs tl { o with appendSites := true }
+  | "--prefix" :: v :: tl, o => parseStageArgs tl { o with pathPrefix := v }
+  | "--dep" :: v :: tl, o =>
+    match parseDepOverride v with
+    | some pair => parseStageArgs tl { o with depOverrides := o.depOverrides.push pair }
+    | none => throw s!"invalid --dep value (expected name=path): {v}"
+  | "--exclude" :: v :: tl, o => parseStageArgs tl { o with excludes := o.excludes.push v }
+  | "--imports" :: v :: tl, o => parseStageArgs tl { o with extraImports := o.extraImports ++ splitImports v }
+  | "--no-bool-ops" :: tl, o => parseStageArgs tl { o with boolOps := false }
+  | "--self" :: tl, o => parseStageArgs tl { o with isSelf := true }
+  | flag :: _, _ => throw s!"unknown option for stage: {flag}"
 
-  -- Auto-discover source directories if none were given explicitly
-  let mut toInstrument : Array String := srcDirs
-  if toInstrument.isEmpty then
-    for entry in (← pkgAbs.readDir) do
-      let name := entry.fileName
-      if name == ".git" || name == ".lake" || name == "build" || name.startsWith "." then continue
-      let p := entry.path
-      if isPrefixPath p stageAbs then continue
-      if (← p.isDir) && (← dirContainsLean p) then
-        toInstrument := toInstrument.push name
-    toInstrument := toInstrument.qsort (· < ·)
+private def resolveLeancovDir (pkgAbs : System.FilePath) (opts : StageOpts) :
+    IO (Except String (System.FilePath × Bool)) := do
+  match opts.leancovDir with
+  | some d =>
+    let abs ← canonicalOrAbs d
+    return .ok (abs, opts.isSelf || pkgAbs == abs)
+  | none =>
+    if opts.isSelf then return .ok (pkgAbs, true)
+    return .error "stage: --leancov <leancovDir> is required (or pass --self)"
 
-  let env ← loadParserEnv cfg.extraImports
-  let mut armedAny : Bool := false
-
-  -- Stage non-source top-level entries
+private def discoverStageSrcDirs (pkgAbs stageAbs : System.FilePath) (explicit : Array String) :
+    IO (Array String) := do
+  if !explicit.isEmpty then return explicit
+  let mut dirs : Array String := #[]
   for entry in (← pkgAbs.readDir) do
     let name := entry.fileName
-    if name == ".git" || name == ".lake" || name == "build" then continue
-    let srcPath := entry.path
-    if isPrefixPath srcPath stageAbs then continue
-    let dstPath := stageAbs / name
-    if name == "lakefile.lean" then
-      let txt ← IO.FS.readFile srcPath
-      IO.FS.writeFile dstPath (rewriteLakefileLean txt pkgAbs leancovAbs isSelf depOverrides)
-    else if name == "lakefile.toml" then
-      let txt ← IO.FS.readFile srcPath
-      IO.FS.writeFile dstPath (rewriteLakefileToml txt pkgAbs leancovAbs isSelf depOverrides)
-    else if name == "lake-manifest.json" then
-      stageLakeManifest pkgAbs stageAbs leancovAbs isSelf depOverrides
-    else if toInstrument.contains name then
-      -- Will be instrumented below
+    if name == ".git" || name == ".lake" || name == "build" || name.startsWith "." then continue
+    let p := entry.path
+    if isPrefixPath p stageAbs then continue
+    if (← p.isDir) && (← dirContainsLean p) then
+      dirs := dirs.push name
+  return dirs.qsort (· < ·)
+
+private def stageTopLevelEntry (env : Environment) (pkgAbs stageAbs leancovAbs : System.FilePath)
+    (isSelf : Bool) (depOverrides : Array (String × String)) (toInstrument : Array String)
+    (entry : IO.FS.DirEntry) : IO Bool := do
+  let name := entry.fileName
+  if name == ".git" || name == ".lake" || name == "build" then return false
+  let srcPath := entry.path
+  if isPrefixPath srcPath stageAbs then return false
+  let dstPath := stageAbs / name
+  if name == "lakefile.lean" then
+    let txt ← IO.FS.readFile srcPath
+    IO.FS.writeFile dstPath (rewriteLakefileLean txt pkgAbs leancovAbs isSelf depOverrides)
+    return false
+  else if name == "lakefile.toml" then
+    let txt ← IO.FS.readFile srcPath
+    IO.FS.writeFile dstPath (rewriteLakefileToml txt pkgAbs leancovAbs isSelf depOverrides)
+    return false
+  else if name == "lake-manifest.json" then
+    stageLakeManifest pkgAbs stageAbs leancovAbs isSelf depOverrides
+    return false
+  else if toInstrument.contains name then
+    -- Will be instrumented below
+    let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dstPath.toString] }
+    return false
+  else if ← srcPath.isDir then
+    if ← dirHasMainLean srcPath then
       let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dstPath.toString] }
-    else if ← srcPath.isDir then
-      if ← dirHasMainLean srcPath then
-        let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dstPath.toString] }
-        let a ← copyDirArmingMains env srcPath dstPath
-        if a then armedAny := true
-      else
-        forceSymlink srcPath dstPath
-    else if srcPath.extension == some "lean" then
-      -- Top-level `.lean` file (e.g. `Main.lean`): instrument/arm directly below
-      pure ()
+      return ← copyDirArmingMains env srcPath dstPath
     else
-      let bytes ← IO.FS.readBinFile srcPath
-      IO.FS.writeBinFile dstPath bytes
+      forceSymlink srcPath dstPath
+      return false
+  else if srcPath.extension == some "lean" then
+    -- Top-level `.lean` file (e.g. `Main.lean`): instrument/arm directly below
+    return false
+  else
+    let bytes ← IO.FS.readBinFile srcPath
+    IO.FS.writeBinFile dstPath bytes
+    return false
 
-  -- Symlink existing `.lake/packages/*` individually so offline builds reuse them without modifying pkgAbs
+private def stageLakePackages (pkgAbs stageAbs : System.FilePath) : IO Unit := do
   let pkgDepsDir := pkgAbs / ".lake" / "packages"
-  if ← pkgDepsDir.isDir then
-    let stageDepsDir := stageAbs / ".lake" / "packages"
-    IO.FS.createDirAll stageDepsDir
-    for entry in (← pkgDepsDir.readDir) do
-      forceSymlink entry.path (stageDepsDir / entry.fileName)
+  unless ← pkgDepsDir.isDir do return
+  let stageDepsDir := stageAbs / ".lake" / "packages"
+  IO.FS.createDirAll stageDepsDir
+  for entry in (← pkgDepsDir.readDir) do
+    forceSymlink entry.path (stageDepsDir / entry.fileName)
 
-  -- Instrument source directories and top-level `.lean` files
-  let mut nextId : Nat := 0
-  let mut allSites : Array Site := #[]
-  let mut allFuncs : Array FuncInfo := #[]
-  let mut allSkipped : Array (String × String) := #[]
+private structure StageAcc where
+  nextId : Nat := 0
+  sites : Array Site := #[]
+  funcs : Array FuncInfo := #[]
+  skipped : Array (String × String) := #[]
+  armedAny : Bool := false
+
+private def loadStageAcc (sitesOut : System.FilePath) (appendSites armedAny : Bool) : IO StageAcc := do
   if appendSites && (← sitesOut.pathExists) then
     let prev ← readManifest sitesOut
-    nextId := prev.sites.size
-    allSites := prev.sites
-    allFuncs := prev.functions
-    allSkipped := prev.skippedFiles
-    if prev.armOnMain then armedAny := true
+    return {
+      nextId := prev.sites.size
+      sites := prev.sites
+      funcs := prev.functions
+      skipped := prev.skippedFiles
+      armedAny := armedAny || prev.armOnMain
+    }
+  return { armedAny }
 
+private unsafe def stageInstrumentDirs (pkgAbs stageAbs : System.FilePath) (toInstrument : Array String)
+    (pathPrefix : String) (cfg : InstrumentConfig) (acc : StageAcc) : IO StageAcc := do
+  let mut st := acc
   for dirName in toInstrument do
     let dispPfx := if pathPrefix.isEmpty then dirName else s!"{pathPrefix}/{dirName}"
-    let m ← instrumentTree (pkgAbs / dirName) (stageAbs / dirName) cfg nextId dispPfx (armMains := true)
-    nextId := nextId + m.sites.size
-    allSites := allSites ++ m.sites
-    allFuncs := allFuncs ++ m.functions
-    allSkipped := allSkipped ++ m.skippedFiles
-    if m.armOnMain then armedAny := true
+    let m ← instrumentTree (pkgAbs / dirName) (stageAbs / dirName) cfg st.nextId dispPfx (armMains := true)
+    st := {
+      nextId := st.nextId + m.sites.size
+      sites := st.sites ++ m.sites
+      funcs := st.funcs ++ m.functions
+      skipped := st.skipped ++ m.skippedFiles
+      armedAny := st.armedAny || m.armOnMain
+    }
+  return st
 
-  -- Instrument any top-level `.lean` files (excluding `lakefile.lean`), arming `def main` even when excluded
+private def stageTopLevelLeanFile (env : Environment) (stageAbs : System.FilePath)
+    (pathPrefix : String) (cfg : InstrumentConfig) (entry : IO.FS.DirEntry) (acc : StageAcc) :
+    IO StageAcc := do
+  let name := entry.fileName
+  if name == "lakefile.lean" then return acc
+  let p := entry.path
+  if (← p.isDir) || p.extension != some "lean" then return acc
+  let src ← IO.FS.readFile p
+  let dispName := if pathPrefix.isEmpty then name else s!"{pathPrefix}/{name}"
+  let excl := cfg.exclude.any fun pat => !pat.isEmpty && ((name.splitOn pat).length > 1 || (dispName.splitOn pat).length > 1)
+  if excl then
+    let (outSrc, armed) ← armMainInSource env dispName src
+    IO.FS.writeFile (stageAbs / name) outSrc
+    return { acc with armedAny := acc.armedAny || armed }
+  let res ← instrumentSource env dispName src acc.nextId cfg
+  let skipped := match res.skippedReason with
+    | some why => acc.skipped.push (dispName, why)
+    | none => acc.skipped
+  let (outSrc, armed) ← armMainInSource env dispName res.instrumented
+  IO.FS.writeFile (stageAbs / name) outSrc
+  return {
+    nextId := res.nextSiteId
+    sites := acc.sites ++ res.sites
+    funcs := acc.funcs ++ res.functions
+    skipped := skipped
+    armedAny := acc.armedAny || armed
+  }
+
+/-- Run `leancov stage`: create a clean out-of-tree instrumented copy of any Lake package. -/
+private unsafe def cmdStage (args : List String) : IO UInt32 := do
+  let opts ← match parseStageArgs args {} with
+    | .ok o => pure o
+    | .error e => IO.eprintln e; return 2
+  let some outDir := opts.stageDir | do
+    IO.eprintln "stage: --out <stageDir> is required"
+    return 2
+  let pkgAbs ← canonicalOrAbs opts.pkgDir
+  let (leancovAbs, isSelf) ← match ← resolveLeancovDir pkgAbs opts with
+    | .ok r => pure r
+    | .error e => IO.eprintln e; return 2
+  IO.FS.createDirAll outDir
+  let stageAbs ← canonicalOrAbs outDir
+  let depOverrides ← opts.depOverrides.mapM fun (k, p) => return (k, (← canonicalOrAbs ⟨p⟩).toString)
+  let sitesOut := opts.sitesPath.getD (stageAbs / "sites.json")
+  let cfg : InstrumentConfig := {
+    exclude := opts.excludes
+    extraImports := opts.extraImports
+    instrumentBoolOps := opts.boolOps
+  }
+
+  let toInstrument ← discoverStageSrcDirs pkgAbs stageAbs opts.srcDirs
+  let env ← loadParserEnv cfg.extraImports
+  let mut armedAny := false
   for entry in (← pkgAbs.readDir) do
-    let name := entry.fileName
-    if name == "lakefile.lean" then continue
-    let p := entry.path
-    if !(← p.isDir) && p.extension == some "lean" then
-      let src ← IO.FS.readFile p
-      let dispName := if pathPrefix.isEmpty then name else s!"{pathPrefix}/{name}"
-      let excl := cfg.exclude.any fun pat => !pat.isEmpty && ((name.splitOn pat).length > 1 || (dispName.splitOn pat).length > 1)
-      if excl then
-        let (outSrc, armed) ← armMainInSource env dispName src
-        if armed then armedAny := true
-        IO.FS.writeFile (stageAbs / name) outSrc
-      else
-        let res ← instrumentSource env dispName src nextId cfg
-        nextId := res.nextSiteId
-        allSites := allSites ++ res.sites
-        allFuncs := allFuncs ++ res.functions
-        if let some why := res.skippedReason then
-          allSkipped := allSkipped.push (dispName, why)
-        let (outSrc, armed) ← armMainInSource env dispName res.instrumented
-        if armed then armedAny := true
-        IO.FS.writeFile (stageAbs / name) outSrc
+    if ← stageTopLevelEntry env pkgAbs stageAbs leancovAbs isSelf depOverrides toInstrument entry then
+      armedAny := true
+
+  -- Symlink existing `.lake/packages/*` individually so offline builds reuse them without modifying pkgAbs
+  stageLakePackages pkgAbs stageAbs
+
+  -- Instrument source directories and top-level `.lean` files
+  let mut acc ← loadStageAcc sitesOut opts.appendSites armedAny
+  acc ← stageInstrumentDirs pkgAbs stageAbs toInstrument opts.pathPrefix cfg acc
+  for entry in (← pkgAbs.readDir) do
+    acc ← stageTopLevelLeanFile env stageAbs opts.pathPrefix cfg entry acc
 
   let manifest : Manifest := {
-    version := 1, armOnMain := armedAny, sites := allSites, functions := allFuncs, skippedFiles := allSkipped
+    version := 1, armOnMain := acc.armedAny, sites := acc.sites, functions := acc.funcs, skippedFiles := acc.skipped
   }
   writeManifest sitesOut manifest
   IO.println s!"Staged {pkgAbs} -> {stageAbs}"
   IO.println s!"  Instrumented dirs: {", ".intercalate toInstrument.toList}"
-  IO.println s!"  Declarations: {allFuncs.size} | Probe sites: {allSites.size} | Manifest: {sitesOut}"
-  if !allSkipped.isEmpty then
-    IO.eprintln s!"  Warning: {allSkipped.size} file(s) skipped:"
-    for (f, why) in allSkipped do
+  IO.println s!"  Declarations: {acc.funcs.size} | Probe sites: {acc.sites.size} | Manifest: {sitesOut}"
+  if !acc.skipped.isEmpty then
+    IO.eprintln s!"  Warning: {acc.skipped.size} file(s) skipped:"
+    for (f, why) in acc.skipped do
       IO.eprintln s!"    {f}: {why}"
   return 0
 
@@ -674,6 +719,9 @@ unsafe def runCLI (args : List String) : IO UInt32 := do
   | "run" :: rest => cmdRun rest
   | "report" :: rest => cmdReport rest
   | "analyze" :: rest => cmdAnalyze rest
+  | "--version" :: _ | "-V" :: _ =>
+    IO.println s!"leancov {version}"
+    return 0
   | "--help" :: _ | "-h" :: _ | "help" :: _ | [] =>
     IO.println usage
     return 0

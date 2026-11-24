@@ -44,6 +44,12 @@ private def skipKind (k : SyntaxNodeKind) : Bool :=
   k == `Lean.Parser.Termination.suffix ||
   k == `Lean.Parser.Command.declModifiers
 
+private def isTermIfKind (k : SyntaxNodeKind) : Bool :=
+  k == `termIfThenElse || k == `termDepIfThenElse || k == `termIfLet
+
+private def isMatchAltsGroup (k : SyntaxNodeKind) : Bool :=
+  k == `Lean.Parser.Term.matchAlts || k == `Lean.Parser.Term.matchAltsWhereDecls || k == `null
+
 private structure WalkState where
   cc : Nat := 1
   cognitive : Nat := 0
@@ -56,130 +62,144 @@ private def addCC (n : Nat := 1) : WalkM Unit :=
 private def addCog (n : Nat) : WalkM Unit :=
   modify fun s => { s with cognitive := s.cognitive + n }
 
-private partial def walk (stx : Syntax) (nesting : Nat) (lastBoolOp : Option Name := none) : WalkM Unit := do
-  match stx with
-  | .missing | .atom .. | .ident .. => pure ()
-  | .node _ k args =>
-    if skipKind k then return
-    match k with
-    | `termIfThenElse | `termDepIfThenElse | `termIfLet =>
-      -- `if` / `else if`: detect chained `else if` on the else branch
-      addCC 1
-      addCog (1 + nesting)
-      -- walk condition(s) at current nesting, then-branch at nesting+1, else-branch:
-      -- if else-branch is another `termIf*`, treat it as `else if` (flat +1 cog instead of nesting)
-      let n := args.size
-      if n ≥ 6 then
-        for i in [1 : n - 4] do walk args[i]! nesting none
-        walk args[n - 3]! (nesting + 1) none
-        let elseStx := args[n - 1]!
-        if elseStx.getKind == `termIfThenElse || elseStx.getKind == `termDepIfThenElse || elseStx.getKind == `termIfLet then
-          walkElseIf elseStx nesting
-        else
-          walk elseStx (nesting + 1) none
-      else
-        for a in args do walk a (nesting + 1) none
-    | `Lean.Parser.Term.doIf =>
-      -- #[atom("if"), cond, atom("then"), thenSeq, elseIfs, elseOpt]
-      addCC 1
-      addCog (1 + nesting)
-      if args.size ≥ 6 then
-        walk args[1]! nesting none
-        walk args[3]! (nesting + 1) none
-        for ei in args[4]!.getArgs do
-          -- group #[group #[else, if], cond, then, seq]
-          addCC 1
-          addCog 1
-          if ei.getNumArgs ≥ 4 then
-            walk (ei.getArg 1) nesting none
-            walk (ei.getArg 3) (nesting + 1) none
-        let elseOpt := args[5]!
-        if elseOpt.getNumArgs ≥ 2 then
-          walk (elseOpt.getArg 1) (nesting + 1) none
-      else
-        for a in args do walk a (nesting + 1) none
-    | `Lean.Parser.Term.doUnless =>
-      addCC 1
-      addCog (1 + nesting)
-      if args.size ≥ 4 then
-        walk args[1]! nesting none
-        walk args[3]! (nesting + 1) none
-    | `Lean.Parser.Term.doFor | `Lean.Parser.Term.doWhile | `Lean.Parser.Term.doRepeat =>
-      addCC 1
-      addCog (1 + nesting)
-      for i in [:args.size] do
-        if i + 1 == args.size then walk args[i]! (nesting + 1) none
-        else walk args[i]! nesting none
-    | `Lean.Parser.Term.doCatch =>
-      addCC 1
-      addCog (1 + nesting)
-      if args.size > 0 then walk args[args.size - 1]! (nesting + 1) none
-    | `Lean.Parser.Term.doLetElse =>
-      -- #[let, mut?, letConfig, pat, :=, val, |, fallbackSeq, contOpt]
-      addCC 1
-      addCog (1 + nesting)
-      if args.size ≥ 6 then walk args[5]! nesting none
-      if args.size ≥ 8 then walk args[7]! (nesting + 1) none
-      if args.size ≥ 9 then walk args[8]! nesting none
-    | `Lean.Parser.Term.doPatDecl =>
-      -- #[pat, typeSpecOpt, "←", val, fallbackOpt]
-      if args.size ≥ 4 then walk args[3]! nesting none
-      if args.size ≥ 5 then
-        let fb := args[4]!
-        if fb.getNumArgs ≥ 2 then
-          addCC 1
-          addCog (1 + nesting)
-          walk (fb.getArg 1) (nesting + 1) none
-          if fb.getNumArgs ≥ 3 then walk (fb.getArg 2) nesting none
-    | `Lean.Parser.Term.match | `Lean.Parser.Term.doMatch | `Lean.Parser.Term.fun | `Lean.Parser.Command.declValEqns =>
-      let hasAlts := containsMatchAlts stx
-      if hasAlts then
-        addCog (1 + nesting)
-        walkMatchContainer stx (nesting + 1)
-      else
-        for a in args do walk a nesting none
-    | `Lean.Parser.Term.matchAlt =>
-      if args.size ≥ 4 then
-        if !isWildcardPattern args[1]! then addCC 1
-        walk args[3]! nesting none
-    | `«term_&&_» | `«term_||_» =>
-      addCC 1
-      if lastBoolOp != some k then addCog 1
-      if args.size ≥ 3 then
-        walk args[0]! nesting (some k)
-        walk args[2]! nesting (some k)
-    | _ =>
-      for a in args do walk a nesting none
-where
-  walkElseIf (stx : Syntax) (nesting : Nat) : WalkM Unit := do
-    let args := stx.getArgs
+mutual
+
+private partial def walkTermIf (args : Array Syntax) (nesting : Nat) (isElseIf : Bool) : WalkM Unit := do
+  -- `if` / `else if`: chained `else if` adds +1 flat without nesting penalty
+  addCC 1
+  addCog (if isElseIf then 1 else 1 + nesting)
+  let n := args.size
+  if n ≥ 6 then
+    for i in [1 : n - 4] do walk args[i]! nesting none
+    walk args[n - 3]! (nesting + 1) none
+    let elseStx := args[n - 1]!
+    if isTermIfKind elseStx.getKind then
+      walkTermIf elseStx.getArgs nesting true
+    else
+      walk elseStx (nesting + 1) none
+  else if !isElseIf then
+    for a in args do walk a (nesting + 1) none
+
+private partial def walkDoIf (args : Array Syntax) (nesting : Nat) : WalkM Unit := do
+  -- #[atom("if"), cond, atom("then"), thenSeq, elseIfs, elseOpt]
+  addCC 1
+  addCog (1 + nesting)
+  unless args.size ≥ 6 do
+    for a in args do walk a (nesting + 1) none
+    return
+  walk args[1]! nesting none
+  walk args[3]! (nesting + 1) none
+  for ei in args[4]!.getArgs do
+    -- group #[group #[else, if], cond, then, seq]
     addCC 1
     addCog 1
-    let n := args.size
-    if n ≥ 6 then
-      for i in [1 : n - 4] do walk args[i]! nesting none
-      walk args[n - 3]! (nesting + 1) none
-      let elseStx := args[n - 1]!
-      if elseStx.getKind == `termIfThenElse || elseStx.getKind == `termDepIfThenElse || elseStx.getKind == `termIfLet then
-        walkElseIf elseStx nesting
-      else
-        walk elseStx (nesting + 1) none
-  walkMatchContainer (s : Syntax) (armNesting : Nat) : WalkM Unit := do
-    match s with
-    | .node _ `Lean.Parser.Term.matchAlt args =>
-      if args.size ≥ 4 then
-        if !isWildcardPattern args[1]! then addCC 1
-        walk args[3]! armNesting none
-    | .node _ k args =>
-      if skipKind k then return
-      if k == `Lean.Parser.Term.matchAlts || k == `Lean.Parser.Term.matchAltsWhereDecls || k == `null then
-        for a in args do walkMatchContainer a armNesting
-      else
-        -- Discriminant or nested `where` declarations stay at outer nesting
-        for a in args do
-          if containsMatchAlts a then walkMatchContainer a armNesting
-          else walk a (armNesting - 1) none
-    | _ => pure ()
+    if ei.getNumArgs ≥ 4 then
+      walk (ei.getArg 1) nesting none
+      walk (ei.getArg 3) (nesting + 1) none
+  let elseOpt := args[5]!
+  if elseOpt.getNumArgs ≥ 2 then
+    walk (elseOpt.getArg 1) (nesting + 1) none
+
+private partial def walkDoUnless (args : Array Syntax) (nesting : Nat) : WalkM Unit := do
+  addCC 1
+  addCog (1 + nesting)
+  if args.size ≥ 4 then
+    walk args[1]! nesting none
+    walk args[3]! (nesting + 1) none
+
+private partial def walkDoLoop (args : Array Syntax) (nesting : Nat) : WalkM Unit := do
+  addCC 1
+  addCog (1 + nesting)
+  for i in [:args.size] do
+    if i + 1 == args.size then walk args[i]! (nesting + 1) none
+    else walk args[i]! nesting none
+
+private partial def walkDoCatch (args : Array Syntax) (nesting : Nat) : WalkM Unit := do
+  addCC 1
+  addCog (1 + nesting)
+  if args.size > 0 then walk args[args.size - 1]! (nesting + 1) none
+
+private partial def walkDoLetElse (args : Array Syntax) (nesting : Nat) : WalkM Unit := do
+  -- #[let, mut?, letConfig, pat, :=, val, |, fallbackSeq, contOpt]
+  addCC 1
+  addCog (1 + nesting)
+  if args.size ≥ 6 then walk args[5]! nesting none
+  if args.size ≥ 8 then walk args[7]! (nesting + 1) none
+  if args.size ≥ 9 then walk args[8]! nesting none
+
+private partial def walkDoPatDecl (args : Array Syntax) (nesting : Nat) : WalkM Unit := do
+  -- #[pat, typeSpecOpt, "←", val, fallbackOpt]
+  if args.size ≥ 4 then walk args[3]! nesting none
+  unless args.size ≥ 5 do return
+  let fb := args[4]!
+  unless fb.getNumArgs ≥ 2 do return
+  addCC 1
+  addCog (1 + nesting)
+  walk (fb.getArg 1) (nesting + 1) none
+  if fb.getNumArgs ≥ 3 then walk (fb.getArg 2) nesting none
+
+private partial def walkMatchAlt (args : Array Syntax) (nesting : Nat) : WalkM Unit := do
+  if args.size ≥ 4 then
+    if !isWildcardPattern args[1]! then addCC 1
+    walk args[3]! nesting none
+
+private partial def walkMatchContainer (s : Syntax) (armNesting : Nat) : WalkM Unit := do
+  let .node _ k args := s | return
+  if k == `Lean.Parser.Term.matchAlt then
+    walkMatchAlt args armNesting
+    return
+  if skipKind k then return
+  if isMatchAltsGroup k then
+    for a in args do walkMatchContainer a armNesting
+  else
+    -- Discriminant or nested `where` declarations stay at outer nesting
+    for a in args do
+      if containsMatchAlts a then walkMatchContainer a armNesting
+      else walk a (armNesting - 1) none
+
+private partial def walkMatchOrEqns (stx : Syntax) (args : Array Syntax) (nesting : Nat) : WalkM Unit := do
+  if containsMatchAlts stx then
+    addCog (1 + nesting)
+    walkMatchContainer stx (nesting + 1)
+  else
+    for a in args do walk a nesting none
+
+private partial def walkBoolOp (k : SyntaxNodeKind) (args : Array Syntax) (nesting : Nat)
+    (lastBoolOp : Option Name) : WalkM Unit := do
+  addCC 1
+  if lastBoolOp != some k then addCog 1
+  if args.size ≥ 3 then
+    walk args[0]! nesting (some k)
+    walk args[2]! nesting (some k)
+
+private partial def walk (stx : Syntax) (nesting : Nat) (lastBoolOp : Option Name := none) : WalkM Unit := do
+  let .node _ k args := stx | return
+  if skipKind k then return
+  match k with
+  | `termIfThenElse | `termDepIfThenElse | `termIfLet =>
+    walkTermIf args nesting false
+  | `Lean.Parser.Term.doIf =>
+    walkDoIf args nesting
+  | `Lean.Parser.Term.doUnless =>
+    walkDoUnless args nesting
+  | `Lean.Parser.Term.doFor | `Lean.Parser.Term.doWhile | `Lean.Parser.Term.doRepeat =>
+    walkDoLoop args nesting
+  | `Lean.Parser.Term.doCatch =>
+    walkDoCatch args nesting
+  | `Lean.Parser.Term.doLetElse =>
+    walkDoLetElse args nesting
+  | `Lean.Parser.Term.doPatDecl =>
+    walkDoPatDecl args nesting
+  | `Lean.Parser.Term.match | `Lean.Parser.Term.doMatch | `Lean.Parser.Term.fun | `Lean.Parser.Command.declValEqns =>
+    walkMatchOrEqns stx args nesting
+  | `Lean.Parser.Term.matchAlt =>
+    walkMatchAlt args nesting
+  | `«term_&&_» | `«term_||_» =>
+    walkBoolOp k args nesting lastBoolOp
+  | _ =>
+    for a in args do walk a nesting none
+
+end
 
 /-- Compute McCabe CC and Cognitive Complexity for a declaration value `Syntax` node. -/
 def measureComplexity (valStx : Syntax) : Complexity :=

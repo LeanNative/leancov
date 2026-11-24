@@ -417,83 +417,87 @@ private partial def walkDoPatDecl (args : Array Syntax) (nesting : Nat) : InstM 
           emitDoProbe_ contSeq .letElseOk nesting
           walkBody contSeq nesting
 
+private partial def walkAt (args : Array Syntax) (idx nesting : Nat) : InstM Unit := do
+  if idx < args.size then walkBody args[idx]! nesting
+
+private partial def walkDoIfProp (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  unless args.size ≥ 2 do return
+  let hasProofBinder := args[0]!.getNumArgs > 0
+  let savedBool := (← get).instrumentBoolOps
+  if hasProofBinder then modify fun s => { s with instrumentBoolOps := false }
+  walkBody args[1]! nesting
+  if hasProofBinder then modify fun s => { s with instrumentBoolOps := savedBool }
+
+private partial def walkDoLetElse (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  if args.size ≥ 6 then walkBody args[5]! nesting
+  if args.size ≥ 8 then
+    emitDoProbe_ args[7]! .letElseFail nesting
+    walkBody args[7]! (nesting + 1)
+  unless args.size ≥ 9 do return
+  let contOpt := args[8]!
+  if contOpt.getNumArgs ≥ 1 then
+    let contSeq := contOpt.getArg 0
+    emitDoProbe_ contSeq .letElseOk nesting
+    walkBody contSeq nesting
+
+private partial def walkDoRepeat (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  for i in [:args.size] do
+    let a := args[i]!
+    if i + 1 == args.size then
+      emitDoProbe_ a .loopBody nesting
+      walkBody a (nesting + 1)
+    else
+      walkBody a nesting
+
+private partial def walkDoCatch (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  if args.size > 0 then
+    let body := args[args.size - 1]!
+    emitDoProbe_ body .catchBody nesting
+    walkBody body (nesting + 1)
+
+private partial def walkMatchAlt (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  unless args.size ≥ 4 do return
+  let rhs := args[3]!
+  if isDoSeq rhs then emitDoProbe_ rhs .matchArm nesting
+  else emitTermWrap rhs .matchArm nesting
+  walkBody rhs (nesting + 1)
+
+private partial def walkBoolOp (k : SyntaxNodeKind) (args : Array Syntax) (nesting : Nat) : InstM Unit := do
+  unless args.size ≥ 3 do
+    for a in args do walkBody a nesting
+    return
+  if (← get).instrumentBoolOps then
+    let (tKind, fKind) :=
+      if k == `«term_&&_» then (BranchKind.andTrue, BranchKind.andFalse)
+      else (BranchKind.orTrue, BranchKind.orFalse)
+    if !isBoolOp args[0]! then emitCondWrap args[0]! tKind fKind nesting
+    if !isBoolOp args[2]! then emitCondWrap args[2]! tKind fKind nesting
+  walkBody args[0]! nesting
+  walkBody args[2]! nesting
+
 private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
-  match stx with
-  | .missing | .atom .. | .ident .. => pure ()
-  | .node _ k args =>
-    if skipWalkKind k then return
-    match k with
-    | `Lean.Parser.Term.typeAscription =>
-      if args.size ≥ 2 then walkBody args[1]! nesting
-    | `termIfThenElse | `termDepIfThenElse | `termIfLet =>
-      walkTermIf k args nesting
-    | `Lean.Parser.Term.doIfProp =>
-      if args.size ≥ 2 then
-        let hasProofBinder := args[0]!.getNumArgs > 0
-        let savedBool := (← get).instrumentBoolOps
-        if hasProofBinder then modify fun s => { s with instrumentBoolOps := false }
-        walkBody args[1]! nesting
-        if hasProofBinder then modify fun s => { s with instrumentBoolOps := savedBool }
-    | `Lean.Parser.Term.doIfLet =>
-      if args.size ≥ 3 then walkBody args[2]! nesting
-    | `Lean.Parser.Term.doIf =>
-      walkDoIf args nesting
-    | `Lean.Parser.Term.doUnless =>
-      walkDoUnless args nesting
-    | `Lean.Parser.Term.doLetElse =>
-      if args.size ≥ 6 then walkBody args[5]! nesting
-      if args.size ≥ 8 then
-        emitDoProbe_ args[7]! .letElseFail nesting
-        walkBody args[7]! (nesting + 1)
-      if args.size ≥ 9 then
-        let contOpt := args[8]!
-        if contOpt.getNumArgs ≥ 1 then
-          let contSeq := contOpt.getArg 0
-          emitDoProbe_ contSeq .letElseOk nesting
-          walkBody contSeq nesting
-    | `Lean.Parser.Term.doFor | `Lean.Parser.Term.doWhile =>
-      walkDoLoop stx args nesting
-    | `Lean.Parser.Term.doRepeat =>
-      for i in [:args.size] do
-        let a := args[i]!
-        if i + 1 == args.size then
-          emitDoProbe_ a .loopBody nesting
-          walkBody a (nesting + 1)
-        else
-          walkBody a nesting
-    | `Lean.Parser.Term.doCatch =>
-      if args.size > 0 then
-        let body := args[args.size - 1]!
-        emitDoProbe_ body .catchBody nesting
-        walkBody body (nesting + 1)
-    | `Lean.Parser.Term.matchAlt =>
-      if args.size ≥ 4 then
-        let rhs := args[3]!
-        if isDoSeq rhs then emitDoProbe_ rhs .matchArm nesting
-        else emitTermWrap rhs .matchArm nesting
-        walkBody rhs (nesting + 1)
-    | `«term_&&_» | `«term_||_» =>
-      if args.size ≥ 3 then
-        if (← get).instrumentBoolOps then
-          let (tKind, fKind) :=
-            if k == `«term_&&_» then (BranchKind.andTrue, BranchKind.andFalse)
-            else (BranchKind.orTrue, BranchKind.orFalse)
-          if !isBoolOp args[0]! then emitCondWrap args[0]! tKind fKind nesting
-          if !isBoolOp args[2]! then emitCondWrap args[2]! tKind fKind nesting
-        walkBody args[0]! nesting
-        walkBody args[2]! nesting
-      else
-        for a in args do walkBody a nesting
-    | `Lean.Parser.Term.letIdDecl | `Lean.Parser.Term.letPatDecl =>
-      if args.size ≥ 5 then walkBody args[4]! nesting
-    | `Lean.Parser.Term.doIdDecl =>
-      if args.size ≥ 4 then walkBody args[3]! nesting
-    | `Lean.Parser.Term.doPatDecl =>
-      walkDoPatDecl args nesting
-    | `Lean.Parser.Term.structInstField =>
-      if args.size ≥ 2 then walkBody args[args.size - 1]! nesting
-    | _ =>
-      for a in args do walkBody a nesting
+  let .node _ k args := stx | return
+  if skipWalkKind k then return
+  match k with
+  | `Lean.Parser.Term.typeAscription => walkAt args 1 nesting
+  | `termIfThenElse | `termDepIfThenElse | `termIfLet => walkTermIf k args nesting
+  | `Lean.Parser.Term.doIfProp => walkDoIfProp args nesting
+  | `Lean.Parser.Term.doIfLet => walkAt args 2 nesting
+  | `Lean.Parser.Term.doIf => walkDoIf args nesting
+  | `Lean.Parser.Term.doUnless => walkDoUnless args nesting
+  | `Lean.Parser.Term.doLetElse => walkDoLetElse args nesting
+  | `Lean.Parser.Term.doFor | `Lean.Parser.Term.doWhile => walkDoLoop stx args nesting
+  | `Lean.Parser.Term.doRepeat => walkDoRepeat args nesting
+  | `Lean.Parser.Term.doCatch => walkDoCatch args nesting
+  | `Lean.Parser.Term.matchAlt => walkMatchAlt args nesting
+  | `«term_&&_» | `«term_||_» => walkBoolOp k args nesting
+  | `Lean.Parser.Term.letIdDecl | `Lean.Parser.Term.letPatDecl => walkAt args 4 nesting
+  | `Lean.Parser.Term.doIdDecl => walkAt args 3 nesting
+  | `Lean.Parser.Term.doPatDecl => walkDoPatDecl args nesting
+  | `Lean.Parser.Term.structInstField =>
+    if args.size ≥ 2 then walkBody args[args.size - 1]! nesting
+  | _ =>
+    for a in args do walkBody a nesting
 
 end
 
@@ -643,55 +647,78 @@ private def instrumentDecl (ns : List String) (cmd : Syntax) (mods inner : Synta
     siteIds := siteIds
   }
 
+private def identParts (s : Syntax) : List String :=
+  match s with
+  | .ident _ _ n _ => n.components.map Name.toString
+  | _ => []
+
+private def pushNamespaceScope (cmd : Syntax) (scopeStack : List (Bool × List String)) (ns : List String) :
+    List (Bool × List String) × List String :=
+  if cmd.getNumArgs ≥ 2 then
+    let parts := identParts (cmd.getArg 1)
+    ((true, parts) :: scopeStack, parts.reverse ++ ns)
+  else (scopeStack, ns)
+
+private def pushSectionScope (cmd : Syntax) (scopeStack : List (Bool × List String)) (ns : List String) :
+    List (Bool × List String) × List String :=
+  let parts :=
+    if cmd.getNumArgs ≥ 2 && (cmd.getArg 1).getNumArgs ≥ 1 then
+      identParts ((cmd.getArg 1).getArg 0)
+    else []
+  ((false, parts) :: scopeStack, ns)
+
+private def popScope (scopeStack : List (Bool × List String)) (ns : List String) :
+    List (Bool × List String) × List String :=
+  match scopeStack with
+  | (isNs, parts) :: rest => (rest, if isNs then ns.drop parts.length else ns)
+  | [] => ([], [])
+
+private def stepScope? (cmd : Syntax) (scopeStack : List (Bool × List String)) (ns : List String) :
+    Option (List (Bool × List String) × List String) :=
+  match cmd.getKind with
+  | `Lean.Parser.Command.namespace => some (pushNamespaceScope cmd scopeStack ns)
+  | `Lean.Parser.Command.section => some (pushSectionScope cmd scopeStack ns)
+  | `Lean.Parser.Command.end => some (popScope scopeStack ns)
+  | _ => none
+
+private def walkDeclCommand (cmd : Syntax) (ns : List String) (funcs : Array FuncInfo) :
+    InstM (Array FuncInfo) := do
+  unless cmd.getNumArgs ≥ 2 do return funcs
+  match ← instrumentDecl ns cmd (cmd.getArg 0) (cmd.getArg 1) with
+  | some fi => return funcs.push fi
+  | none => return funcs
+
+mutual
+
+private partial def walkMutualCommand (cmd : Syntax) (scopeStack : List (Bool × List String)) (ns : List String)
+    (funcs : Array FuncInfo) : InstM (Array FuncInfo) := do
+  -- #[atom("mutual"), null(decls), atom("end")]
+  let mut fs := funcs
+  if cmd.getNumArgs ≥ 2 then
+    for d in (cmd.getArg 1).getArgs do
+      let (_, _, fs') ← walkCommand d scopeStack ns fs
+      fs := fs'
+  return fs
+
 /-- Walk top-level commands, maintaining the `namespace` / `section` stack. -/
 private partial def walkCommand (cmd : Syntax) (scopeStack : List (Bool × List String)) (ns : List String)
     (funcs : Array FuncInfo) : InstM (List (Bool × List String) × List String × Array FuncInfo) := do
+  if let some (ss, ns') := stepScope? cmd scopeStack ns then
+    return (ss, ns', funcs)
   match cmd.getKind with
-  | `Lean.Parser.Command.namespace =>
-    -- #[atom("namespace"), ident(A.B)]
-    if cmd.getNumArgs ≥ 2 then
-      let parts := match cmd.getArg 1 with
-        | .ident _ _ n _ => n.components.map Name.toString
-        | _ => []
-      return ((true, parts) :: scopeStack, parts.reverse ++ ns, funcs)
-    return (scopeStack, ns, funcs)
-  | `Lean.Parser.Command.section =>
-    let parts :=
-      if cmd.getNumArgs ≥ 2 && (cmd.getArg 1).getNumArgs ≥ 1 then
-        match (cmd.getArg 1).getArg 0 with
-        | .ident _ _ n _ => n.components.map Name.toString
-        | _ => []
-      else []
-    return ((false, parts) :: scopeStack, ns, funcs)
-  | `Lean.Parser.Command.end =>
-    match scopeStack with
-    | (isNs, parts) :: rest =>
-      let ns' := if isNs then ns.drop parts.length else ns
-      return (rest, ns', funcs)
-    | [] => return ([], [], funcs)
   | `Lean.Parser.Command.in =>
     -- `section ... in cmd` / `open ... in cmd` / `attribute ... in cmd`
     if cmd.getNumArgs ≥ 3 then
       walkCommand (cmd.getArg 2) scopeStack ns funcs
     else
       return (scopeStack, ns, funcs)
+  | `Lean.Parser.Command.mutual =>
+    return (scopeStack, ns, ← walkMutualCommand cmd scopeStack ns funcs)
   | `Lean.Parser.Command.declaration =>
-    if cmd.getNumArgs ≥ 2 then
-      let mods := cmd.getArg 0
-      let inner := cmd.getArg 1
-      if inner.getKind == `Lean.Parser.Command.mutual then
-        -- #[atom("mutual"), null(decls), atom("end")]
-        let mut fs := funcs
-        if inner.getNumArgs ≥ 2 then
-          for d in (inner.getArg 1).getArgs do
-            let (_, _, fs') ← walkCommand d scopeStack ns fs
-            fs := fs'
-        return (scopeStack, ns, fs)
-      else
-        if let some fi ← instrumentDecl ns cmd mods inner then
-          return (scopeStack, ns, funcs.push fi)
-    return (scopeStack, ns, funcs)
+    return (scopeStack, ns, ← walkDeclCommand cmd ns funcs)
   | _ => return (scopeStack, ns, funcs)
+
+end
 
 /-- Result of instrumenting a single `.lean` source file. -/
 structure FileResult where
@@ -773,52 +800,34 @@ private partial def wrapMainEqns (fileMap : FileMap) (s : Syntax) (acc : Array E
   | .node _ _ args => args.foldl (fun a c => wrapMainEqns fileMap c a) acc
   | _ => acc
 
+private def collectMainDeclEdits (fileMap : FileMap) (cmd : Syntax) (ns : List String)
+    (edits : Array Edit) : Array Edit := Id.run do
+  unless cmd.getNumArgs ≥ 2 do return edits
+  let inner := cmd.getArg 1
+  unless inner.getKind == `Lean.Parser.Command.definition && inner.getNumArgs ≥ 4 do return edits
+  let nm := declIdName (inner.getArg 1)
+  unless (ns.isEmpty && nm == "main") || nm == "_root_.main" do return edits
+  let valStx := inner.getArg 3
+  match valStx.getKind with
+  | `Lean.Parser.Command.declValSimple =>
+    if valStx.getNumArgs ≥ 2 then wrapMainExpr fileMap (valStx.getArg 1) edits else edits
+  | `Lean.Parser.Command.declValEqns =>
+    wrapMainEqns fileMap valStx edits
+  | _ => edits
+
 private partial def collectMainArmEdits (fileMap : FileMap) (cmd : Syntax)
     (scopeStack : List (Bool × List String)) (ns : List String) (edits : Array Edit) :
     List (Bool × List String) × List String × Array Edit :=
-  match cmd.getKind with
-  | `Lean.Parser.Command.namespace =>
-    if cmd.getNumArgs ≥ 2 then
-      let parts := match cmd.getArg 1 with
-        | .ident _ _ n _ => n.components.map Name.toString
-        | _ => []
-      ((true, parts) :: scopeStack, parts.reverse ++ ns, edits)
-    else (scopeStack, ns, edits)
-  | `Lean.Parser.Command.section =>
-    let parts :=
-      if cmd.getNumArgs ≥ 2 && (cmd.getArg 1).getNumArgs ≥ 1 then
-        match (cmd.getArg 1).getArg 0 with
-        | .ident _ _ n _ => n.components.map Name.toString
-        | _ => []
-      else []
-    ((false, parts) :: scopeStack, ns, edits)
-  | `Lean.Parser.Command.end =>
-    match scopeStack with
-    | (isNs, parts) :: rest =>
-      let ns' := if isNs then ns.drop parts.length else ns
-      (rest, ns', edits)
-    | [] => ([], [], edits)
-  | `Lean.Parser.Command.in =>
-    if cmd.getNumArgs ≥ 3 then collectMainArmEdits fileMap (cmd.getArg 2) scopeStack ns edits
-    else (scopeStack, ns, edits)
-  | `Lean.Parser.Command.declaration =>
-    if cmd.getNumArgs ≥ 2 then
-      let inner := cmd.getArg 1
-      if inner.getKind == `Lean.Parser.Command.definition && inner.getNumArgs ≥ 4 then
-        let nm := declIdName (inner.getArg 1)
-        if (ns.isEmpty && nm == "main") || nm == "_root_.main" then
-          let valStx := inner.getArg 3
-          let edits' := match valStx.getKind with
-            | `Lean.Parser.Command.declValSimple =>
-              if valStx.getNumArgs ≥ 2 then wrapMainExpr fileMap (valStx.getArg 1) edits else edits
-            | `Lean.Parser.Command.declValEqns =>
-              wrapMainEqns fileMap valStx edits
-            | _ => edits
-          (scopeStack, ns, edits')
-        else (scopeStack, ns, edits)
+  match stepScope? cmd scopeStack ns with
+  | some (ss, ns') => (ss, ns', edits)
+  | none =>
+    match cmd.getKind with
+    | `Lean.Parser.Command.in =>
+      if cmd.getNumArgs ≥ 3 then collectMainArmEdits fileMap (cmd.getArg 2) scopeStack ns edits
       else (scopeStack, ns, edits)
-    else (scopeStack, ns, edits)
-  | _ => (scopeStack, ns, edits)
+    | `Lean.Parser.Command.declaration =>
+      (scopeStack, ns, collectMainDeclEdits fileMap cmd ns edits)
+    | _ => (scopeStack, ns, edits)
 
 /-- Inject `LeanCov.arm ()` at entry to top-level `def main` so `LEAN_COV_DEFER_INIT=1` ignores
 all probe hits fired during module initialization (`initialize_*`) before `main` begins. -/
