@@ -8,7 +8,7 @@ target leancov_rt.o pkg : System.FilePath := do
   let oFile := pkg.buildDir / "c" / "leancov_rt.o"
   let srcJob ← inputTextFile <| pkg.dir / "c" / "leancov_rt.c"
   let weakArgs := #["-I", (← getLeanIncludeDir).toString]
-  buildO oFile srcJob weakArgs #["-fPIC", "-O2", "-Wall", "-Wextra"] "cc" getLeanTrace
+  buildO oFile srcJob weakArgs #["-fPIC", "-O2", "-std=c11", "-Wall", "-Wextra"] "cc" getLeanTrace
 
 extern_lib libleancov_rt pkg := do
   let name := nameToStaticLib "leancov_rt"

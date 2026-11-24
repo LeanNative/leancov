@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <lean/lean.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -55,7 +56,11 @@ static void leancov_init_impl(void) {
     size_t sites = 0;
     const char *sites_env = getenv("LEAN_COV_SITES");
     if (sites_env && sites_env[0] != '\0') {
-        unsigned long long parsed = strtoull(sites_env, NULL, 10);
+        unsigned long long parsed = 0;
+        for (const char *p = sites_env; *p >= '0' && *p <= '9'; p++) {
+            parsed = parsed * 10ULL + (unsigned long long)(*p - '0');
+            if (parsed > (1ULL << 26)) break;
+        }
         if (parsed > 0 && parsed <= (1ULL << 26)) {
             sites = (size_t)parsed;
         }
