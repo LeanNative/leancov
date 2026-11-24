@@ -30,16 +30,52 @@ private def structLen : List Nat → Nat
   | _ :: xs => LeanCov.hit 7 fun () => 1 + structLen xs
 termination_by structural x => x
 
+-- Verify `@[expose, reducible]` probe transparency to kernel `rfl`
+theorem structLen_nil : structLen [] = 0 := rfl
+theorem cond_transparent (b : Bool) : LeanCov.cond 1 2 b = b := rfl
+theorem pass_transparent (x : Nat) : LeanCov.pass 1 x = x := rfl
+theorem mark_transparent : LeanCov.mark 1 = true := rfl
+
+private def catchesRT (act : IO α) : IO Bool :=
+  try let _ ← act; pure false catch _ => pure true
+
 private def checkHarness : TM Unit := do
+  LeanCov.raiseStack ()
   check "basic truth" (1 + 1 == 2)
   checkEq "pureProbeId(0)" (pureProbeId 0) 42
   checkEq "pureProbeId(4)" (pureProbeId 4) (4 + 0 + 2)
   checkEq "structLen" (structLen [10, 20, 30]) 3
+  let _ := LeanCov.pass 8 123
+  let _ := LeanCov.mark 9
   let v ← need "ok except" (Except.ok 99 : Except String Nat)
   checkEq "need unwrapped" v 99
+  let vt ← need "ok exceptT" (pure 77 : ExceptT String IO Nat)
+  checkEq "need exceptT" vt 77
+  check "need throws on error" (← catchesRT (need "bad" (Except.error "err" : Except String Nat)))
   let e ← needE "ok custom" id (Except.ok "hi" : Except String String)
   checkEq "needE unwrapped" e "hi"
+  check "needE throws on error" (← catchesRT (needE "badE" unnamed (Except.error "err" : Except String Nat)))
   refused "expected error" (Except.error "boom" : Except String Nat) (kind := "boom")
+  refused "expected error any kind" (Except.error "boom" : Except String Nat)
+
+  -- Exercise progressLines, failure recording, refused mismatch, and runTest filtering/abort paths,
+  -- then restore global tally/flags so the suite exits cleanly with 0 failures.
+  let savedTally ← tally.get
+  progressLines.set true
+  check "progress with detail" true "all good"
+  check "synthetic fail" false "expected"
+  refused "synthetic unexpected ok" (Except.ok 1 : Except String Nat)
+  refused "synthetic wrong kind" (Except.error "boom" : Except String Nat) (kind := "other")
+  refused "synthetic pred false" (Except.error "boom" : Except String Nat) (kind := "boom") (matching := fun _ => false)
+  progressLines.set false
+  onlyTests.set (some "run_target")
+  runTest "skipped_case" (pure ())
+  runTest "run_target_tm_err" (throw "tm abort")
+  runTest "run_target_io_err" (liftM (throw (IO.userError "io abort") : IO Unit))
+  onlyTests.set none
+  let tempTally ← tally.get
+  tally.set savedTally
+  check "synthetic failures were recorded before restore" (tempTally.failures.size ≥ 5)
 
 private def checkFuzzPrimitives : TM Unit := do
   let r1 ← IO.mkRef (12345 : UInt64)

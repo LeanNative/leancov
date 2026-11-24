@@ -75,6 +75,10 @@ private def testTypesAndProfiles : TM Unit := do
   IO.FS.writeBinFile p2 (mkProf #[2, 5, 10, 0])
   let merged ← mergeProfiles #[p1, p2] 4
   checkEq "merge sums & saturates" merged #[5, 5, maxU64, 1]
+  let pZero := dir / "p0.cov"
+  initProfile pZero 0
+  checkEq "0-site profile read" (← readProfile pZero) #[]
+  checkEq "empty mergeProfiles" (← mergeProfiles #[] 0) #[]
 
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
 
@@ -402,33 +406,112 @@ def mutOdd : Nat → Bool
 end
 
 class Inc (α : Type) where
+  constTag : Nat := 0
   inc : α → α
+  ping : IO Unit := pure ()
 
 instance namedInc : Inc Nat where
   inc n := if n > 0 then n + 1 else 1
 
 instance : Inc Bool where
+  constTag := 7
   inc b := !b
+
+instance lamAndDoInc : Inc Int where
+  constTag := 9
+  inc := fun x => x + 1
+  ping := do
+    pure ()
+
+class PureConstCls (α : Type) where
+  tag : Nat
+
+instance pureOnlyInst : PureConstCls Nat where
+  tag := 42
 
 noncomputable def skipNoncomp (x : Nat) : Nat := x
 theorem skipThm : 1 = 1 := rfl
 def skipTactic : Nat := by exact 1
 def skipProp (n : Nat) : Prop := n = 0
+def skipTypeAlias : Type := Nat
+def skipSortAlias : Sort 1 := Prop
+def unannotatedTypeAlias (α : Type) := α
+meta def skipMeta (x : Nat) : Nat := x
+unsafe def skipUnsafe (x : Nat) : Nat := x
+
+def richBinders {α : Type} ⦃_β : Type⦄ [Inhabited α] (x : Nat) (o : Option Nat) : Nat :=
+  let _n := `foo
+  let _m := ``Nat
+  if x == 0 then 1 else if let some v := o then v else
+  suffices _h : x = x from (if x > 0 then x else 0 : Nat)
+  rfl
+
+def funMatchFn : Nat → Nat := fun
+  | 0 => 1
+  | n => n
+
+def _root_.topRootFn (x : Nat) : Nat := if x > 0 then x else 1
+
+instance eqnsWhereInst : Inc UInt8 where
+  inc
+    | 0 => 1
+    | n => helper n
+where
+  helper (k : UInt8) : UInt8 := k + 1
+
+def doDepAndPat (x : Nat) : IO Nat := do
+  if _h : x > 0 && x < 10 then
+    let (a, b) ← pure (x, 1)
+    return a + b
+  let (c, _) ← pure (0, 1) | return 99
+  return c
 
 def doShapes (flag : Bool) : Id Nat := do
   let mut acc := 0
+  if flag then {
+    acc := acc + 1
+  }
   if flag then { acc := acc + 1; acc := acc + 1 }
   if flag then acc := acc + 2
+  if let some v := (some 1 : Option Nat) then if flag then
+    acc := acc + v
+  if flag then acc := acc + 3
+               acc := acc + 4
+  if !flag then { acc := acc + 1 } else if flag then
+    acc := acc + 5
+    acc := acc + 6
+  if !flag then { acc := acc + 1 } else if flag then acc := acc + 5
+                                                     acc := acc + 6
+  unless !flag do {
+    acc := acc + 2
+  }
   unless !flag do { acc := acc + 3 }
   unless !flag do acc := acc + 4
-  let _ ← if flag then do
-    acc := acc + 5
+  unless !flag do if flag then acc := acc + 1
+  unless !flag do acc := acc + 7
+                  acc := acc + 8
+  match acc with
+  | 0 => unless !flag do acc := acc + 1
+  | 1 => { acc := acc + 2 }
+  | _ => pure ()
+  if flag then acc := 1 else acc := 2
+                             acc := 3
+  if (flag &&
+      (acc == 0 || acc > 0)) then
+    for x in [1, 2] do acc := acc + x
+  if flag then for x in [1, 2] do acc := acc + x
+  for x in [1, 2] do acc := acc + x
+                     acc := acc + 1
   for x in [1, 2] do { acc := acc + x }
   let mut k := 1
   repeat
     if k == 0 then break
     k := k - 1
-  return acc
+  return match flag with
+    | true =>
+      acc +
+      1
+    | false => acc
 
 end Outer.Inner
 "
@@ -439,6 +522,16 @@ end Outer.Inner
   check "mutual def mutEven found" (cmdRes.functions.any (·.name == "Outer.Inner.mutEven"))
   check "mutual def mutOdd found" (cmdRes.functions.any (·.name == "Outer.Inner.mutOdd"))
   check "named instance found" (cmdRes.functions.any (·.name == "Outer.Inner.namedInc"))
+  -- Callable 0-branch `instance ... where` fields get `.fnEntry` probes while pure constant fields do not!
+  let anonBoolInst ← need "anon Inc Bool instance found"
+    (match cmdRes.functions.find? (fun f => (f.name.splitOn "(instance").length > 1) with
+     | some f => Except.ok f | none => Except.error "missing")
+  checkEq "anon Inc Bool has 1 fn.entry probe (skips constTag)" anonBoolInst.siteIds.size 1
+  let lamDoInst ← need "lamAndDoInc instance found"
+    (match cmdRes.functions.find? (·.name == "Outer.Inner.lamAndDoInc") with
+     | some f => Except.ok f | none => Except.error "missing")
+  checkEq "lamAndDoInc has 2 fn.entry probes (fun + do, skips constTag)" lamDoInst.siteIds.size 2
+  check "pure-constant-only instance excluded" (!cmdRes.functions.any (·.name == "Outer.Inner.pureOnlyInst"))
   check "noncomputable skipped" (!cmdRes.functions.any (·.name == "Outer.Inner.skipNoncomp"))
   check "theorem skipped" (!cmdRes.functions.any (·.name == "Outer.Inner.skipThm"))
   check "tactic def skipped" (!cmdRes.functions.any (·.name == "Outer.Inner.skipTactic"))
@@ -483,6 +576,45 @@ end Outer.Inner
 
   let (_, okBad) ← armMainInSource env "BadMain.lean" "def main ( := \n"
   check "armMainInSource syntax error returns false" (!okBad)
+
+  -- Resilient per-command parsing + module-namespace `def main` arming + single-pass `armMains`
+  let partialErrSrc := "namespace App.Runner\ndef helper (x : Nat) : IO UInt32 := if x > 0 then pure 0 else pure 1\nmeta def badQuot : Unit := `(UnknownSyntaxCat| foo)\ndef afterErr (x : Nat) : IO UInt32 := if x == 0 then pure 1 else pure 0\ndef main : IO UInt32 := do\n  let _ ← helper 1\n  afterErr 1\nend App.Runner\n"
+  let pRes ← instrumentSource env "Pkg/App/Runner.lean" partialErrSrc 0 { armMains := true }
+  checkEq "partial command error does not skip whole file" pRes.skippedReason none
+  check "valid helper before custom syntax is instrumented" (pRes.functions.any (·.name == "App.Runner.helper"))
+  check "valid def after custom syntax is instrumented" (pRes.functions.any (·.name == "App.Runner.afterErr"))
+  check "module-namespaced main armed in single pass" pRes.armedMain
+  check "module-namespaced main has LeanCov.arm" ((pRes.instrumented.splitOn "LeanCov.arm ()").length > 1)
+
+  let mutMainSrc := "import LeanCov.Runtime\nmutual\ndef main : IO Unit := do\n  pure ()\nend\n"
+  let (amMut, okMut) ← armMainInSource env "MutMain.lean" mutMainSrc
+  check "mutual main armed" okMut
+  check "existing Runtime import not duplicated" ((amMut.splitOn "import LeanCov.Runtime").length == 2)
+
+  -- Overlapping splice events (`SpliceEvent.lt`): same-byte open+open (diff & equal spanEnd), close+close, open+replace
+  let spliceSrc := "def overlap (x : Nat) (a b : Bool) : Bool := match x with | 0 => a && b | _ => false\ndef tabFn (flag : Bool) : Id Nat := do\n\tif flag then\n\t\treturn 1\n\treturn 0\ndef main (n : Nat) : IO UInt32 := pure 0\n"
+  let spRes ← instrumentSource env "Splice.lean" spliceSrc 0 { armMains := true }
+  check "overlap + parameterized main armed & instrumented" (spRes.armedMain && spRes.sites.size ≥ 5)
+
+  -- Pure 0-probe `main` files under `instrumentSource { armMains := true }` & `armMainInSource` variants
+  let pureMainNoHdr ← instrumentSource env "PureMain0.lean" "def main : IO Unit := pure ()\n" 0 { armMains := true }
+  check "pure main hdrEnd=0 armed" (pureMainNoHdr.armedMain && (pureMainNoHdr.instrumented.splitOn "import LeanCov.Runtime").length > 1)
+  let pureMainDoStx ← instrumentSource env "PureMain1.lean" "import LeanCov.DoSyntax\ndef main : IO Unit := pure ()\n" 0 { armMains := true }
+  check "pure main with DoSyntax armed without extra Runtime" pureMainDoStx.armedMain
+  let pureMainRt ← instrumentSource env "PureMain2.lean" "import LeanCov.Runtime\ndef main : IO Unit := pure ()\n" 0 { armMains := true }
+  check "pure main with Runtime armed" pureMainRt.armedMain
+  let (_, okCommentMain) ← armMainInSource env "CommentMain.lean" "-- mentions main in comment\ndef foo : Nat := 1\n"
+  check "comment mentioning main is not armed" (!okCommentMain)
+  let (amDoStx, okDoStx) ← armMainInSource env "DoStxMain.lean" "import LeanCov.DoSyntax\ndef main : IO Unit := pure ()\n"
+  check "armMainInSource with existing DoSyntax import" (okDoStx && (amDoStx.splitOn "import LeanCov.Runtime").length == 1)
+
+  -- Direct `resolveSysroot` checks (env override, project dir, and standalone `/tmp` elan fallback)
+  let srCustom ← resolveSysroot none (some "/custom/lean/sysroot")
+  checkEq "resolveSysroot honors env override" srCustom ⟨"/custom/lean/sysroot"⟩
+  let srHere ← resolveSysroot (some ⟨"."⟩) (some "")
+  check "resolveSysroot from project dir non-empty" (!srHere.toString.isEmpty)
+  let srStandalone ← resolveSysroot (some ⟨"/tmp"⟩) (some "")
+  check "resolveSysroot standalone fallback non-empty" (!srStandalone.toString.isEmpty)
 
 private def testReportAndLcov : TM Unit := do
   -- Mix real branches AND straight-line `fn.entry` to verify strict branch vs function separation
@@ -550,6 +682,8 @@ private def testReportAndLcov : TM Unit := do
   check "LCOV end_of_record" ((lcov.splitOn "end_of_record").length > 1)
 
   -- Empty manifest & high-CRAP / tie-breaker cases
+  let shortHitsRep := buildReport manifest #[]
+  checkEq "short hits array treated as 0 hits" shortHitsRep.sitesHit 0
   let emptyRep := buildReport {} #[]
   checkEq "empty report sitesTotal" emptyRep.sitesTotal 0
   checkEq "empty report functionsTotal" emptyRep.functionsTotal 0
@@ -560,21 +694,41 @@ private def testReportAndLcov : TM Unit := do
   let tieManifest : Manifest := {
     sites := #[
       { id := 0, file := "T.lean", decl := "T.a", line := 1, col := 1, kind := .ifThen },
-      { id := 1, file := "T.lean", decl := "T.b", line := 5, col := 1, kind := .ifThen }
+      { id := 1, file := "T.lean", decl := "T.b", line := 5, col := 1, kind := .ifThen },
+      { id := 2, file := "T.lean", decl := "T.c", line := 5, col := 9, kind := .ifElse },
+      { id := 3, file := "T.lean", decl := "T.c", line := 5, col := 5, kind := .ifThen },
+      { id := 4, file := "T.lean", decl := "T.c", line := 3, col := 2, kind := .ifThen },
+      { id := 5, file := "SitesOnly.lean", decl := "Ghost", line := 2, col := 1, kind := .ifThen }
     ]
     functions := #[
-      { name := "T.b", file := "T.lean", line := 5, endLine := 6, lines := 2, cc := 10, cognitive := 10, siteIds := #[1] },
       { name := "T.a", file := "T.lean", line := 1, endLine := 2, lines := 2, cc := 10, cognitive := 10, siteIds := #[0] },
+      { name := "T.b", file := "T.lean", line := 5, endLine := 6, lines := 2, cc := 10, cognitive := 10, siteIds := #[1] },
+      { name := "T.cogHi", file := "T.lean", line := 6, endLine := 7, lines := 2, cc := 10, cognitive := 14, siteIds := #[1] },
+      { name := "T.cogLo", file := "T.lean", line := 6, endLine := 7, lines := 2, cc := 10, cognitive := 6, siteIds := #[1] },
+      { name := "T.ccHi", file := "T.lean", line := 6, endLine := 7, lines := 2, cc := 14, cognitive := 10, siteIds := #[1] },
+      { name := "T.ccLo", file := "T.lean", line := 6, endLine := 7, lines := 2, cc := 6, cognitive := 10, siteIds := #[1, 999] },
+      { name := "T.z", file := "T.lean", line := 6, endLine := 7, lines := 2, cc := 10, cognitive := 10, siteIds := #[1] },
+      { name := "T.c", file := "T.lean", line := 3, endLine := 8, lines := 6, cc := 10, cognitive := 20, siteIds := #[2, 3, 4] },
+      { name := "T.mid", file := "T.lean", line := 8, endLine := 9, lines := 2, cc := 14, cognitive := 20, siteIds := #[2, 3] },
+      { name := "T.big", file := "T.lean", line := 9, endLine := 12, lines := 4, cc := 20, cognitive := 16, siteIds := #[] },
+      { name := "T.low", file := "T.lean", line := 13, endLine := 14, lines := 2, cc := 2, cognitive := 1, siteIds := #[0] },
       { name := "T.empty", file := "OnlyFn.lean", line := 1, endLine := 1, lines := 1, cc := 1, cognitive := 0, siteIds := #[] }
     ]
   }
-  let tieRep := buildReport tieManifest #[0, 0]
-  checkEq "tieRep crapOver30" tieRep.crapOver30 2
-  checkEq "tieRep cogCrapOver30" tieRep.cogCrapOver30 2
+  let tieRep := buildReport tieManifest #[0, 0, 0, 1, 0, 1]
+  check "tieRep crapOver30 >= 3" (tieRep.crapOver30 ≥ 3)
+  check "tieRep cogCrapOver30 >= 4" (tieRep.cogCrapOver30 ≥ 4)
   for key in #[SortKey.crap, .cog, .cc, .uncov] do
-    let txt := formatReport tieRep 5 key true true true
+    let txt := formatReport tieRep 12 key true true true
     check s!"tie formatReport({key.toString})" ((txt.splitOn "T.a").length > 1)
-  check "tie lcov includes OnlyFn.lean" (((toLcov tieManifest #[0, 0]).splitOn "SF:OnlyFn.lean").length > 1)
+  check "formatReport showMissed=false" (((formatReport tieRep 5 .crap false false false).splitOn "missed lines:").length == 1)
+  check "formatReport topN=0 omits table" (((formatReport tieRep 0 .crap false false false).splitOn "Top ").length == 1)
+  check "staticAnalysis >15 counters" (((formatStaticAnalysis tieManifest 10 true).splitOn "(>15:").length > 1)
+  check "staticAnalysis cc tie-break" (((formatStaticAnalysis tieManifest 10 false).splitOn "T.big").length > 1)
+  check "staticAnalysis topN=0" (((formatStaticAnalysis tieManifest 0 false).splitOn "Top ").length == 1)
+  let tieLcov := toLcov tieManifest #[0, 0, 0, 1, 0, 1]
+  check "tie lcov includes OnlyFn.lean" ((tieLcov.splitOn "SF:OnlyFn.lean").length > 1)
+  check "tie lcov includes SitesOnly.lean (FNF:0)" ((tieLcov.splitOn "SF:SitesOnly.lean").length > 1)
 
 private unsafe def testCLISubcommands : TM Unit := do
   let dir : System.FilePath := ".lake/build/tmp_cli_test"
@@ -610,7 +764,7 @@ private unsafe def testCLISubcommands : TM Unit := do
   -- `analyze`
   let analyzeJson := dir / "analyze.json"
   checkEq "cli analyze cog" (← LeanCov.CLI.runCLI ["analyze", "--src", (pkgToml / "Lib").toString, "--json", analyzeJson.toString, "--top", "5", "--sort", "cog"]) 0
-  checkEq "cli analyze cc" (← LeanCov.CLI.runCLI ["analyze", "--src", (pkgToml / "Lib").toString, "--exclude", "Nope", "--imports", "Init", "--sort", "cc"]) 0
+  checkEq "cli analyze multi-src cc" (← LeanCov.CLI.runCLI ["analyze", "--src", (pkgToml / "Lib").toString, "--src", (pkgLean / "Src").toString, "--exclude", "Nope", "--imports", "Init", "--sort", "cc"]) 0
   checkEq "cli analyze missing src" (← LeanCov.CLI.runCLI ["analyze"]) 2
   checkEq "cli analyze bad top" (← LeanCov.CLI.runCLI ["analyze", "--src", (pkgToml / "Lib").toString, "--top", "abc"]) 2
   checkEq "cli analyze unknown opt" (← LeanCov.CLI.runCLI ["analyze", "--bogus"]) 2
@@ -622,6 +776,14 @@ private unsafe def testCLISubcommands : TM Unit := do
   check "instrument wrote sites" (← instSites.pathExists)
   let instColonOut := dir / "inst_colon_out"
   checkEq "cli instrument src:out" (← LeanCov.CLI.runCLI ["instrument", "--src", s!"{pkgToml / "Lib"}:{instColonOut}", "--sites", (dir / "inst_colon.json").toString]) 0
+  -- Multi-`--src` instrument with a parse-error file to exercise prefixing & skipped warning loop
+  let badSrcDir := dir / "bad_src_dir"
+  IO.FS.createDirAll badSrcDir
+  IO.FS.writeFile (badSrcDir / "BrokenInst.lean") "def oops ( :=\n"
+  checkEq "cli instrument multi-src + skipped warning" (← LeanCov.CLI.runCLI [
+    "instrument", "--src", (pkgToml / "Lib").toString, "--src", badSrcDir.toString,
+    "--out", (dir / "multi_inst").toString, "--sites", (dir / "multi_sites.json").toString
+  ]) 0
   checkEq "cli instrument missing src" (← LeanCov.CLI.runCLI ["instrument", "--sites", instSites.toString]) 2
   checkEq "cli instrument missing sites" (← LeanCov.CLI.runCLI ["instrument", "--src", (pkgToml / "Lib").toString]) 2
   checkEq "cli instrument missing out" (← LeanCov.CLI.runCLI ["instrument", "--src", (pkgToml / "Lib").toString, "--sites", instSites.toString]) 2
@@ -631,6 +793,7 @@ private unsafe def testCLISubcommands : TM Unit := do
   checkEq "cli stage unknown opt" (← LeanCov.CLI.runCLI ["stage", "--bogus"]) 2
   checkEq "cli stage bad --dep" (← LeanCov.CLI.runCLI ["stage", "--dep", "notapair", "--out", (dir / "err1").toString, "--self"]) 2
   checkEq "cli stage empty --dep val" (← LeanCov.CLI.runCLI ["stage", "--dep", "k=", "--out", (dir / "err1").toString, "--self"]) 2
+  checkEq "cli stage empty --dep key" (← LeanCov.CLI.runCLI ["stage", "--dep", "=v", "--out", (dir / "err1").toString, "--self"]) 2
   checkEq "cli stage missing --out" (← LeanCov.CLI.runCLI ["stage", "--pkg", pkgToml.toString, "--self"]) 2
   checkEq "cli stage missing --leancov" (← LeanCov.CLI.runCLI ["stage", "--pkg", pkgToml.toString, "--out", (dir / "err2").toString]) 2
 
@@ -686,11 +849,15 @@ private unsafe def testCLISubcommands : TM Unit := do
   check "stage --self armed excluded top-level Main.lean" ((selfMainOut.splitOn "LeanCov.arm ()").length > 1)
   let exclSubMain ← IO.FS.readFile (selfStageOut / "Mod" / "ExcludedMain.lean")
   check "stage --self armed excluded Mod/ExcludedMain.lean" ((exclSubMain.splitOn "LeanCov.arm ()").length > 1)
-  -- Also exercise instrumentTree on an empty directory + excluded file in analyzeOnly mode
+  -- Also exercise instrumentTree on an empty directory + excluded file in analyzeOnly & non-armMains modes
   let emptySrc := dir / "empty_src"
   IO.FS.createDirAll emptySrc
   let mEmpty ← instrumentTree emptySrc (dir / "empty_out") {}
   checkEq "instrumentTree empty dir sites" mEmpty.sites.size 0
+  let mNoArm ← instrumentTree (pkgSelf / "Mod") (dir / "no_arm_out") { exclude := #["", "ExcludedMain.lean"] } 0 "Pfx/" (armMains := false)
+  check "instrumentTree non-armMains wrote output" (!mNoArm.armOnMain && !mNoArm.sites.isEmpty)
+  checkEq "relativeTo non-matching base" (relativeTo ⟨"/other/root"⟩ ⟨"/different/file.lean"⟩) "/different/file.lean"
+  checkEq "relativeTo trailing slash base" (relativeTo ⟨"/a/b/"⟩ ⟨"/a/b/c.lean"⟩) "c.lean"
   let mAnalyzeExcl ← instrumentTree (pkgSelf / "Mod") (pkgSelf / "Mod") { exclude := #["ExcludedMain.lean"], analyzeOnly := true }
   check "instrumentTree analyzeOnly skipped parse error" (!mAnalyzeExcl.skippedFiles.isEmpty)
   let selfLeanOut ← IO.FS.readFile (selfStageOut / "lakefile.lean")
@@ -699,18 +866,56 @@ private unsafe def testCLISubcommands : TM Unit := do
   -- Also cover `--leancov` equal to `--pkg` (implicit isSelf) and lakefile.toml with existing leancov + abs path
   let pkgSelfToml := dir / "pkg_self_toml"
   IO.FS.createDirAll (pkgSelfToml / "Mod")
+  IO.FS.createDirAll (pkgSelfToml / "NoMainDir")
+  IO.FS.createDirAll (pkgSelfToml / "NestedMain" / ".git")
+  IO.FS.createDirAll (pkgSelfToml / "NestedMain" / "Sub")
+  IO.FS.createDirAll (pkgSelfToml / ".lake" / "packages")
+  IO.FS.writeFile (pkgSelfToml / "lean-toolchain") "\n"
   IO.FS.writeFile (pkgSelfToml / "lakefile.toml")
     "name = \"selftoml\"\n[[require]]\nname = \"leancov\"\npath = \"/abs/lc\"\n"
   IO.FS.writeFile (pkgSelfToml / "lake-manifest.json")
-    "{\"version\":\"1.3.0\",\"packages\":[{\"type\":\"path\",\"name\":\"leancov\",\"dir\":\"/abs/lc\"},{\"type\":\"git\",\"name\":\"std\"}]}"
+    "{\"version\":\"1.3.0\",\"packages\":[{\"type\":\"path\",\"name\":\"leancov\",\"dir\":\"/abs/lc\"},{\"type\":\"path\",\"name\":\"relpkg\",\"dir\":\"../rel\"},{\"type\":\"git\",\"name\":\"std\"}]}"
   IO.FS.writeFile (pkgSelfToml / "Mod" / "M.lean") "def m (x : Nat) : Nat := x + 1\n"
-  checkEq "cli stage --leancov == --pkg" (← LeanCov.CLI.runCLI [
+  IO.FS.writeFile (pkgSelfToml / "NoMainDir" / "Helper.lean") "def helperOnly (x : Nat) : Nat := x\n"
+  IO.FS.writeFile (pkgSelfToml / "NestedMain" / "Sub" / "Main.lean") "def main : IO Unit := pure ()\n"
+  checkEq "cli stage --leancov + --self + nested main" (← LeanCov.CLI.runCLI [
     "stage", "--pkg", pkgSelfToml.toString, "--out", (dir / "stage_self_toml").toString,
-    "--leancov", pkgSelfToml.toString
+    "--leancov", ".", "--src-dir", "Mod"
   ]) 0
+  checkEq "cli stage explicit --leancov --self" (← LeanCov.CLI.runCLI [
+    "stage", "--pkg", pkgSelfToml.toString, "--out", (dir / "stage_self_toml2").toString,
+    "--leancov", pkgSelfToml.toString, "--self", "--src-dir", "Mod"
+  ]) 0
+
+  -- Cross-toolchain `.leancov-pkg` isolation + nested `copyDirArmingMains` subdirectories & binary assets
+  let pkgCross := dir / "pkg_cross_tc"
+  IO.FS.createDirAll (pkgCross / "Lib")
+  IO.FS.createDirAll (pkgCross / "Runner" / "Sub")
+  IO.FS.writeFile (pkgCross / "lean-toolchain") "leanprover/lean4:v4.34.1\n"
+  IO.FS.writeFile (pkgCross / "lakefile.toml") "[package]\nname = \"crosstc\"\n[[require]]\nname = \"absdep\"\npath = \"/abs/dep\"\n"
+  IO.FS.writeFile (pkgCross / "lake-manifest.json") "{\"version\":\"1.3.0\"}"
+  IO.FS.writeFile (pkgCross / "Lib" / "Core.lean") "def coreFn (n : Nat) : Nat := if n > 0 then n else 1\n"
+  IO.FS.writeFile (pkgCross / "Runner" / "Main.lean") "def main : IO Unit := pure ()\n"
+  IO.FS.writeFile (pkgCross / "Runner" / "Sub" / "Helper.lean") "def h (x : Nat) : Nat := x\n"
+  IO.FS.writeFile (pkgCross / "Runner" / "Sub" / "data.bin") "raw"
+  let stageCross := dir / "stage_cross_tc"
+  checkEq "cli stage cross-toolchain isolates .leancov-pkg" (← LeanCov.CLI.runCLI [
+    "stage", "--pkg", pkgCross.toString, "--out", stageCross.toString,
+    "--leancov", ".", "--src-dir", "Lib", "--sites", (dir / "fresh_append_sites.json").toString, "--append-sites"
+  ]) 0
+  check "materialized .leancov-pkg/lakefile.lean" (← (stageCross / ".leancov-pkg" / "lakefile.lean").pathExists)
+  check "copied Runner/Sub/data.bin via copyDirArmingMains" (← (stageCross / "Runner" / "Sub" / "data.bin").pathExists)
 
   -- `run` + `report` (with --files, --kinds, --missed, --json, --lcov, and CI pass/fail gates)
   let prof := dir / "p.cov"
+  let freshAppendProf := dir / "fresh_append.cov"
+  checkEq "cli run --append on non-existent profile + unarmed sites" (← LeanCov.CLI.runCLI [
+    "run", "--sites", instSites.toString, "--profile", freshAppendProf.toString, "--append", "--", "true"
+  ]) 0
+  checkEq "cli report missing profile-dir + empty profile-dir" (← LeanCov.CLI.runCLI [
+    "report", "--sites", instSites.toString, "--profile-dir", (dir / "no_such_prof_dir").toString,
+    "--profile-dir", (pkgCross / "Lib").toString
+  ]) 2
   checkEq "cli run true" (← LeanCov.CLI.runCLI ["run", "--sites", combinedSites.toString, "--profile", prof.toString, "--", "true"]) 0
   check "cli run created profile" (← prof.pathExists)
   checkEq "cli run --append" (← LeanCov.CLI.runCLI ["run", "--sites", combinedSites.toString, "--profile", prof.toString, "--append", "--no-defer-init", "--", "true"]) 0
@@ -726,8 +931,14 @@ private unsafe def testCLISubcommands : TM Unit := do
   checkEq "cli report ok" (← LeanCov.CLI.runCLI [
     "report", "--sites", combinedSites.toString, "--profile-dir", dir.toString,
     "--files", "--kinds", "--missed", "--sort", "cog", "--top", "10",
-    "--json", repJson.toString, "--lcov", repLcov.toString
+    "--json", repJson.toString, "--lcov", repLcov.toString,
+    "--min-cov", "0.0", "--max-crap", "100.0", "--max-cog-crap", "100.0"
   ]) 0
+  let badSitesFile := dir / "bad_sites.json"
+  IO.FS.writeFile badSitesFile "{invalid json"
+  check "cli report invalid sites.json throws" (← catchesIO (LeanCov.CLI.runCLI [
+    "report", "--sites", badSitesFile.toString, "--profile", prof.toString
+  ]))
   checkEq "cli report min-cov fail" (← LeanCov.CLI.runCLI [
     "report", "--sites", combinedSites.toString, "--profile", prof.toString, "--min-cov", "50.0", "--top", "0"
   ]) 1
@@ -781,13 +992,19 @@ private def testFuzzPrimitives : TM Unit := do
     IO.FS.createDirAll (fdir / "corpus" / "clean")
     IO.FS.writeBinFile (fdir / "corpus" / "clean" / "seed1.bin") "abc".toUTF8
     IO.FS.writeFile (fdir / "corpus" / "clean" / "README.txt") "ignored"
-    -- 1. Clean run with corpus replay (and ignored non-.bin file)
+    -- 1. Clean run with corpus replay (and ignored non-.bin file) + uppercase hex seed & --target all
     let okOut ← IO.Process.output {
       cmd := fuzzBin.toString
-      args := #["--target", "clean", "--iterations", "50", "--seed", "0x42", "--max-input", "64"]
+      args := #["--target", "all", "--iterations", "20", "--seed", "0x4A", "--max-input", "64"]
       env := #[("LEANCOV_TEST_CORPUS", some (fdir / "corpus").toString)]
     }
-    check "fuzz clean + corpus passes" (okOut.exitCode == 0) s!"{okOut.stdout}{okOut.stderr}"
+    check "fuzz all + hex seed fails on intentional finding target" (okOut.exitCode == 1)
+    let okClean ← IO.Process.output {
+      cmd := fuzzBin.toString
+      args := #["--target", "clean", "--iterations", "50", "--seed", "0x4f", "--max-input", "64"]
+      env := #[("LEANCOV_TEST_CORPUS", some (fdir / "corpus").toString)]
+    }
+    check "fuzz clean + corpus passes" (okClean.exitCode == 0) s!"{okClean.stdout}{okClean.stderr}"
     -- 2. Finding caught & saved (with decimal seed)
     let findOut ← IO.Process.output {
       cmd := fuzzBin.toString
@@ -805,9 +1022,22 @@ private def testFuzzPrimitives : TM Unit := do
     for badArgs in #[#["--bogus"], #["--iterations", "nope"], #["--seed", "0xZZ"], #["--max-input", "abc"]] do
       let badOut ← IO.Process.output { cmd := fuzzBin.toString, args := badArgs }
       checkEq s!"fuzz bad option {badArgs} exits 2" badOut.exitCode 2
-    -- 5. Unknown target exits 2
+    -- 5. Unknown target exits 2 + corpus error paths + 0-iteration clean run
     let unkOut ← IO.Process.output { cmd := fuzzBin.toString, args := #["--target", "doesnotexist", "--iterations", "1"] }
     checkEq "fuzz unknown target exits 2" unkOut.exitCode 2
+    let zeroIter ← IO.Process.output { cmd := fuzzBin.toString, args := #["--target", "clean", "--iterations", "0"] }
+    checkEq "fuzz 0 iterations exits 0" zeroIter.exitCode 0
+    let missingCorp ← IO.Process.output {
+      cmd := fuzzBin.toString, args := #["--target", "clean", "--iterations", "1"]
+      env := #[("LEANCOV_TEST_CORPUS", some (fdir / "no_such_corpus").toString)]
+    }
+    check "fuzz missing corpus dir fails" (missingCorp.exitCode != 0)
+    IO.FS.createDirAll (fdir / "bad_corpus" / "ghost_target")
+    let badCorp ← IO.Process.output {
+      cmd := fuzzBin.toString, args := #["--target", "clean", "--iterations", "1"]
+      env := #[("LEANCOV_TEST_CORPUS", some (fdir / "bad_corpus").toString)]
+    }
+    check "fuzz unknown corpus subdir fails" (badCorp.exitCode != 0)
     let _ ← IO.Process.output { cmd := "rm", args := #["-rf", fdir.toString] }
 
 /-- End-to-end ground-truth verification: stage, build, and execute a real binary, then assert
@@ -963,6 +1193,266 @@ def main : IO Unit := do
 
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
 
+private unsafe def testMutateEngineAndCLI : TM Unit := do
+  -- 1. MutantKind & MutantOutcome JSON round-trips
+  for k in #[MutantKind.cmpFlip, .boolOpFlip, .boolLitFlip, .negRemove, .condNegate] do
+    checkEq s!"MutantKind ofString {k.toString}" (MutantKind.ofString? k.toString) (some k)
+    let back : Except String MutantKind := fromJson? (toJson k)
+    checkEq s!"MutantKind json {k.toString}" back.toOption (some k)
+  checkEq "MutantKind unknown" (MutantKind.ofString? "nope") none
+  check "MutantKind bad json" (fromJson? (Json.str "nope") : Except String MutantKind).toOption.isNone
+
+  for o in #[MutantOutcome.killed, .survived, .timeout, .uncompilable] do
+    checkEq s!"MutantOutcome ofString {o.toString}" (MutantOutcome.ofString? o.toString) (some o)
+    let back : Except String MutantOutcome := fromJson? (toJson o)
+    checkEq s!"MutantOutcome json {o.toString}" back.toOption (some o)
+  checkEq "MutantOutcome unknown" (MutantOutcome.ofString? "nope") none
+  check "MutantOutcome bad json" (fromJson? (Json.str "nope") : Except String MutantOutcome).toOption.isNone
+
+  -- 2. AST-guided mutant discovery & splicing across operators, patterns, proofs, and filters
+  let env ← loadParserEnv
+  let mutSrc := "
+namespace MutDemo
+meta def badMutQuot : Unit := `(UnknownCat| x)
+structure FlagBox where
+  val : Bool
+
+instance : BEq FlagBox where
+  beq a b := a.val == b.val
+
+abbrev flipAbb (b : Bool) : Bool := !b
+
+def eqnsMut : Bool → Bool
+  | .true => false
+  | .false => true
+
+section S
+open Nat in
+def checkOps (a b : Nat) (x y : Bool) (o : Option Bool) : IO Bool := do
+  have _h : a = a := by rfl
+  let localInit := false
+  let mut bindInit : Bool ← pure true
+  let box : FlagBox := { val := (true : Bool) }
+  let (p, _) := (box.val, localInit)
+  let some q ← pure o | return false
+  let some r := o | return Bool.true
+  for z in [Bool.false] do
+    if let some _ := o then pure ()
+  let _propEq := if a = b then 1 else if a ≠ b then 2 else 0
+  let _depVal := if _h2 : a < b then true else false
+  let _ifLetVal := if let some v := o then v else false
+  let _unparenNeg := !Bool.not x
+  let _longNeg := !((a < b) && (a <= b) && (a > b) && (a >= b) && bindInit)
+  if _hd : a < b then
+    let (u, _) ← pure (true, false)
+    if !u then return false
+  if (x &&
+      y) then
+    unless y do return !x
+  else if (a < b && a <= b && a ≤ b && a > b && a >= b && a ≥ b && a == b && a != b) then
+    return !(x || y)
+  else
+    pure ()
+  return if p && q && r && !(id x) then true else false
+where
+  helper (n : Nat) : Bool := n < 10
+end S
+
+theorem skipTheorem (n : Nat) : n = n := rfl
+noncomputable def skipNc (b : Bool) : Bool := !b
+def skipPropFn (a b : Nat) : Prop := a < b
+def skipTacMut : Bool := by exact true
+
+mutual
+def m1 (b : Bool) : Bool := if b then m2 false else true
+def m2 (b : Bool) : Bool := !b
+end
+end MutDemo
+"
+  let allMs ← discoverMutantsInSource env "MutDemo.lean" mutSrc 0 #[]
+  check "discovered >= 20 mutants" (allMs.size ≥ 20)
+  check "skipped theorem" (!allMs.any (·.decl == "MutDemo.skipTheorem"))
+  check "skipped noncomputable" (!allMs.any (·.decl == "MutDemo.skipNc"))
+  check "skipped Prop fn" (!allMs.any (·.decl == "MutDemo.skipPropFn"))
+  check "has cmpFlip" (allMs.any (·.kind == .cmpFlip))
+  check "has boolOpFlip" (allMs.any (·.kind == .boolOpFlip))
+  check "has boolLitFlip" (allMs.any (·.kind == .boolLitFlip))
+  check "has negRemove" (allMs.any (·.kind == .negRemove))
+  check "has condNegate" (allMs.any (·.kind == .condNegate))
+  -- Every single spliced mutant must still parse cleanly as valid Lean 4 syntax!
+  for m in allMs do
+    let mutated := applyMutant mutSrc m
+    check s!"mutant #{m.id} changes source" (mutated != mutSrc)
+    let r ← instrumentSource env "MutatedCheck.lean" mutated 0 { analyzeOnly := true }
+    checkEq s!"mutant #{m.id} ({m.original} -> {m.replacement}) parses cleanly" r.skippedReason none
+
+  let filtMs ← discoverMutantsInSource env "MutDemo.lean" mutSrc 0 #["", "m2"]
+  checkEq "filtered to m2 only" filtMs.size 1
+  checkEq "m2 mutant decl" filtMs[0]!.decl "MutDemo.m2"
+  checkEq "empty source yields 0 mutants" (← discoverMutantsInSource env "Empty.lean" "").size 0
+  checkEq "parse error yields 0 mutants" (← discoverMutantsInSource env "Bad.lean" "namespace Broken\ndef broken ( :=\nend Broken\n").size 0
+  checkEq "header error yields 0 mutants" (← discoverMutantsInSource env "BadH.lean" "import 123\n").size 0
+
+  -- 3. End-to-end `leancov mutate` on a mini Lake package covering:
+  --    killed, survived, uncompilable (dependent array bounds), timeout, --json, --min-score, --keep-work
+  let dir : System.FilePath := ".lake/build/tmp_mutate_e2e"
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+  let pkg := dir / "pkg"
+  IO.FS.createDirAll (pkg / "Mini")
+  IO.FS.writeFile (pkg / "lean-toolchain") (← IO.FS.readFile "lean-toolchain")
+  IO.FS.writeFile (pkg / "lakefile.toml")
+    "name = \"mini\"\ndefaultTargets = [\"mini-test\"]\n[[lean_lib]]\nname = \"Mini\"\n[[lean_exe]]\nname = \"mini-test\"\nroot = \"Main\"\n"
+  IO.FS.writeFile (pkg / "Mini.lean") "import Mini.Lib\nimport Mini.Spin\n"
+  IO.FS.writeFile (pkg / "Mini" / "Lib.lean") "namespace Mini
+
+-- Dependent `h : 0 < xs.size`: mutating `<` -> `≤` fails compilation (`uncompilable`)!
+def safeFirst (xs : Array Nat) : Nat :=
+  if h : 0 < xs.size then xs[0] else 0
+
+-- Boundary `age >= 18` tested only at 20 and 10 -> `>=` -> `>` SURVIVES!
+def isAdult (age : Nat) : Bool :=
+  age >= 18
+
+-- Strictly tested at both true and false -> `&&` -> `||` and `true` -> `false` are KILLED!
+def strictGate (ok : Bool) : Bool :=
+  ok && true
+
+end Mini
+"
+  IO.FS.writeFile (pkg / "Mini" / "Spin.lean") "namespace Mini
+def keepGoing : Bool := true
+end Mini
+"
+  IO.FS.writeFile (pkg / "Main.lean") "import Mini
+open Mini
+
+def main : IO UInt32 := do
+  if safeFirst #[9] != 9 || safeFirst #[] != 0 then return 1
+  if !isAdult 20 || isAdult 10 then return 1
+  if !strictGate true || strictGate false then return 1
+  return 0
+"
+  let jsonPath := dir / "mutate.json"
+  let workDir := dir / "work"
+  -- Run with --min-score 95.0 -> must exit 1 because `isAdult` boundary mutant (`>=` -> `>`) survives!
+  let codeFail ← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkg.toString, "--out", workDir.toString,
+    "--file", "Mini/Lib.lean", "--build-target", "mini-test",
+    "--json", jsonPath.toString, "--min-score", "95.0",
+    "--", ".lake/build/bin/mini-test"
+  ]
+  checkEq "mutate exits 1 when below --min-score 95" codeFail 1
+  check "workDir cleaned up without --keep-work" (!(← workDir.pathExists))
+  check "mutate wrote json" (← jsonPath.pathExists)
+  let jRaw ← IO.FS.readFile jsonPath
+  let jObj ← needE "parse mutate.json" id (Json.parse jRaw)
+  let uncomp ← needE "uncompilable field" id (jObj.getObjValAs? Nat "uncompilable")
+  let killed ← needE "killed field" id (jObj.getObjValAs? Nat "killed")
+  let survived ← needE "survived field" id (jObj.getObjValAs? Nat "survived")
+  let tested ← needE "tested field" id (jObj.getObjValAs? Nat "tested")
+  check "at least 1 uncompilable mutant (safeFirst)" (uncomp ≥ 1)
+  check "at least 2 killed mutants (strictGate)" (killed ≥ 2)
+  check "at least 1 survived mutant (isAdult >= 18)" (survived ≥ 1)
+  checkEq "tested == killed + survived" tested (killed + survived)
+
+  -- Re-run filtered to `strictGate` with `--min-score 100`, `--max-mutants 2`, and `--keep-work` -> exits 0!
+  let workKept := dir / "work_kept"
+  let codePass ← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkg.toString, "--out", workKept.toString,
+    "--src-dir", "Mini", "--filter", "strictGate", "--max-mutants", "2",
+    "--build-target", "mini-test", "--min-score", "100.0", "--keep-work",
+    "--", ".lake/build/bin/mini-test"
+  ]
+  checkEq "mutate strictGate 100% passes" codePass 0
+  check "workDir preserved with --keep-work" (← workKept.pathExists)
+
+  -- Fast wall-clock timeout verification (`--no-build --timeout 0.15`)
+  let timeoutJson := dir / "timeout.json"
+  let codeTimeout ← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkg.toString, "--file", "Mini/Spin.lean",
+    "--no-build", "--timeout", "0.15", "--json", timeoutJson.toString, "--min-score", "100.0",
+    "--", "sh", "-c", "grep -q 'true' Mini/Spin.lean || sleep 5"
+  ]
+  checkEq "timeout counts toward killed+timeout score 100%" codeTimeout 0
+  let tj ← needE "parse timeout.json" id (Json.parse (← IO.FS.readFile timeoutJson))
+  let toutCount ← needE "timeout field" id (tj.getObjValAs? Nat "timeout")
+  checkEq "recorded 1 timeout mutant" toutCount 1
+
+  -- CLI validation & edge paths (0-mutant 100%, warm cache, lakefile.lean, unmutated binary guard, baseline fail)
+  let pkgLeanMut := dir / "pkg_lean_mut"
+  IO.FS.createDirAll (pkgLeanMut / "Sub" / "Nested")
+  IO.FS.createDirAll (pkgLeanMut / ".git")
+  IO.FS.createDirAll (pkgLeanMut / "build")
+  IO.FS.createDirAll (pkgLeanMut / "Sub" / ".git")
+  IO.FS.createDirAll (pkgLeanMut / ".lake" / "build" / "ir")
+  IO.FS.createDirAll (pkgLeanMut / ".lake" / "build" / "bin")
+  IO.FS.writeFile (pkgLeanMut / ".lake" / "build" / "ir" / "dummy.c") ""
+  IO.FS.writeFile (pkgLeanMut / ".lake" / "build" / "bin" / "unmutated-bin") ""
+  IO.FS.writeFile (pkgLeanMut / "lakefile.lean") "import Lake\nopen Lake DSL\npackage p\nrequire g from git \"https://example.com/g\"\nrequire a from \"/abs/a\"\n"
+  IO.FS.writeFile (pkgLeanMut / "lake-manifest.json") "[]"
+  IO.FS.writeFile (pkgLeanMut / "TopNote.txt") "asset"
+  IO.FS.writeFile (pkgLeanMut / "Sub" / "Nested" / "Data.txt") "nested"
+  IO.FS.writeFile (pkgLeanMut / "Sub" / "NoMut.lean") "def idNat (n : Nat) : Nat := n\n"
+  let okScript := dir / "pass.sh"
+  IO.FS.writeFile okScript "#!/bin/sh\nexit 0\n"
+  let _ ← IO.Process.output { cmd := "chmod", args := #["+x", okScript.toString] }
+  -- 0-mutant run (with comma filter + empty item, --imports, nested --out inside pkg, duplicate --file/--src-dir, callerCwd script) -> 100.0%
+  checkEq "mutate 0-mutant 100%" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkgLeanMut.toString, "--out", (pkgLeanMut / "Sub" / "work_in_pkg").toString,
+    "--file", (pkgLeanMut / "Sub" / "NoMut.lean").toString, "--file", "Sub/NoMut.lean",
+    "--src-dir", "Sub", "--filter", ",idNat,other,", "--imports", "Init", "--no-build", okScript.toString
+  ]) 0
+  -- Reject --file pointing outside --pkg
+  checkEq "mutate rejects file outside pkg" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkgLeanMut.toString, "--file", (pkg / "Mini" / "Lib.lean").toString, "--", "true"
+  ]) 2
+  -- Sampled report header (`discovered > generated`) via --max-mutants 1 on Mini/Lib.lean
+  checkEq "mutate sampled --max-mutants 1" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkg.toString, "--file", "Mini/Lib.lean", "--max-mutants", "1", "--no-build", "--", "true"
+  ]) 0
+  -- Guard against pointing <testCmd> at unmutated --pkg/.lake/build/bin/* (both abs and rel)
+  let absUnmut ← IO.FS.realPath (pkgLeanMut / ".lake" / "build" / "bin" / "unmutated-bin")
+  checkEq "mutate rejects abs unmutated pkg/.lake binary" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkgLeanMut.toString, "--file", "Sub/NoMut.lean", "--no-build",
+    "--", absUnmut.toString
+  ]) 2
+  checkEq "mutate rejects unmutated pkg/.lake binary" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkgLeanMut.toString, "--file", "Sub/NoMut.lean", "--no-build",
+    "--", (pkgLeanMut / ".lake" / "build" / "bin" / "unmutated-bin").toString
+  ]) 2
+  checkEq "empty instrument args" (← LeanCov.CLI.runCLI ["instrument"]) 2
+  checkEq "empty run args" (← LeanCov.CLI.runCLI ["run"]) 2
+  checkEq "empty report args" (← LeanCov.CLI.runCLI ["report"]) 2
+  checkEq "empty mutate args" (← LeanCov.CLI.runCLI ["mutate"]) 2
+  -- Baseline test failure & baseline test timeout exit 2
+  checkEq "mutate baseline test failure exits 2" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkgLeanMut.toString, "--file", "Sub/NoMut.lean", "--no-build", "--", "false"
+  ]) 2
+  checkEq "mutate baseline test timeout exits 2" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkgLeanMut.toString, "--file", "Sub/NoMut.lean", "--no-build", "--timeout", "0.1", "--", "sleep", "5"
+  ]) 2
+  -- Baseline build failure exits 2
+  checkEq "mutate baseline build failure exits 2" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkgLeanMut.toString, "--file", "Sub/NoMut.lean",
+    "--build-target", "nonexistent-target-xyz", "--", "true"
+  ]) 2
+  let emptyMutDir := pkgLeanMut / "EmptyDir"
+  IO.FS.createDirAll emptyMutDir
+  checkEq "mutate empty src-dir exits 2" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkgLeanMut.toString, "--src-dir", "EmptyDir", "--", "true"
+  ]) 2
+  checkEq "mutate missing cmd" (← LeanCov.CLI.runCLI ["mutate", "--pkg", pkg.toString, "--file", "Mini/Lib.lean"]) 2
+  checkEq "mutate missing file/src-dir" (← LeanCov.CLI.runCLI ["mutate", "--pkg", pkg.toString, "--", "true"]) 2
+  checkEq "mutate missing file path" (← LeanCov.CLI.runCLI ["mutate", "--pkg", pkg.toString, "--file", "Nope.lean", "--", "true"]) 2
+  checkEq "mutate missing src-dir" (← LeanCov.CLI.runCLI ["mutate", "--pkg", pkg.toString, "--src-dir", "NopeDir", "--", "true"]) 2
+  checkEq "mutate bad max-mutants" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--max-mutants", "abc", "--", "true"]) 2
+  checkEq "mutate zero timeout" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--timeout", "0", "--", "true"]) 2
+  checkEq "mutate bad timeout" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--timeout", "abc", "--", "true"]) 2
+  checkEq "mutate bad min-score" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--min-score", "abc", "--", "true"]) 2
+  checkEq "mutate unknown opt" (← LeanCov.CLI.runCLI ["mutate", "--bogus"]) 2
+
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+
 unsafe def main : IO UInt32 :=
   runMain "leancov-test" do
     runTest "types & binary profiles" testTypesAndProfiles
@@ -972,3 +1462,4 @@ unsafe def main : IO UInt32 :=
     runTest "CLI subcommands end-to-end" testCLISubcommands
     runTest "fuzz primitives & mutator" testFuzzPrimitives
     runTest "exact binary runtime counters (ground truth)" testExactRuntimeCounters
+    runTest "AST mutation engine & mutate CLI" testMutateEngineAndCLI

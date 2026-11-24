@@ -71,5 +71,6 @@ jobs:
           .lake/build/bin/leancov report \
             --sites build/self-stage/sites.json \
             --profile build/self-stage/self.cov \
-            --files --kinds --sort cog --top 10
+            --files --kinds --sort cog --top 10 \
+            --min-cov 85
           rm -rf build/self-stage

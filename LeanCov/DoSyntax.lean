@@ -1,7 +1,7 @@
 module
 
 public import LeanCov.Runtime
-public meta import Lean
+public meta import Lean.Elab.Do
 
 /-! # `do`-block and term coverage probe syntax (`leancov_hit%`, `leancov_term%`)
 
@@ -20,7 +20,8 @@ end
 
 private meta def wrapWithHit (n : Lean.TSyntax `num) (bodyExpr : Lean.Expr) : Lean.Elab.Term.TermElabM Lean.Expr := do
   let bodyType ← Lean.Meta.inferType bodyExpr
-  if ← Lean.Meta.isProp bodyExpr then
+  let bodyTypeWhnf ← Lean.Meta.whnf bodyType
+  if (← Lean.Meta.isProp bodyExpr) || bodyType.isSort || bodyTypeWhnf.isSort then
     return bodyExpr
   let some u ← (try some <$> Lean.Meta.getDecLevel bodyType catch _ => pure none)
     | return bodyExpr
@@ -41,5 +42,5 @@ public meta def elabDoCovHit : Lean.Elab.Do.DoElab := fun stx dec => do
 @[term_elab termCovHit]
 public meta def elabTermCovHit : Lean.Elab.Term.TermElab := fun stx expectedType? => do
   let `(termCovHit| leancov_term% $n:num $body) := stx | Lean.Elab.throwUnsupportedSyntax
-  let bodyExpr ← Lean.Elab.Term.elabTerm body expectedType?
+  let bodyExpr ← Lean.Elab.Term.elabTermEnsuringType body expectedType?
   wrapWithHit n bodyExpr

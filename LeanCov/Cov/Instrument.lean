@@ -87,6 +87,8 @@ structure InstrumentConfig where
   instrumentBoolOps : Bool := true
   /-- When `true`, only measure complexity and sites without writing instrumented files. -/
   analyzeOnly : Bool := false
+  /-- When `true`, also arm entry `def main` declarations on the same parsed AST pass. -/
+  armMains : Bool := false
   deriving Inhabited
 
 private structure FileState where
@@ -125,14 +127,6 @@ private def addReplace (startPos len : Nat) (text : String) : InstM Unit := do
   modify fun s =>
     let q := s.nextSeq
     { s with nextSeq := q + 1, edits := s.edits.push { startPos, endPos := startPos + len, seq := q, openText := text, replaceLen := len } }
-
-private def sliceOf (stx : Syntax) : InstM String := do
-  let s ← get
-  match stx.getPos?, stx.getTailPos? with
-  | some a, some b =>
-    let bytes := s.src.toUTF8
-    return String.fromUTF8! (bytes.extract a.byteIdx (min b.byteIdx bytes.size))
-  | _, _ => return ""
 
 private def isDoSeq (stx : Syntax) : Bool :=
   stx.getKind == `Lean.Parser.Term.doSeqIndent || stx.getKind == `Lean.Parser.Term.doSeqBracketed
@@ -189,7 +183,7 @@ private def emitDoProbe (seq : Syntax) (kind : BranchKind) (nesting : Nat) : Ins
 private def emitDoProbe_ (seq : Syntax) (kind : BranchKind) (nesting : Nat) : InstM Unit := do
   let _ ← emitDoProbe seq kind nesting
 
-private partial def unwrapParen (s : Syntax) : Syntax :=
+partial def unwrapParen (s : Syntax) : Syntax :=
   if s.getKind == `Lean.Parser.Term.paren && s.getNumArgs ≥ 2 then
     unwrapParen (s.getArg 1)
   else s
@@ -214,8 +208,10 @@ private def addSemisBetweenDoItems (seq : Syntax) : InstM Unit := do
     let items := (seq.getArg 0).getArgs
     for i in [:items.size] do
       if i + 1 < items.size then
-        if let some tail := items[i]!.getTailPos? then
-          addWrap tail.byteIdx tail.byteIdx "" ";"
+        let item := items[i]!
+        if let some tail := item.getTailPos? then
+          let start := (item.getPos?.map (·.byteIdx)).getD 0
+          addWrap start tail.byteIdx "" ";"
 
 /-- Instrument a one-armed `if c then seq` (or trailing `else if c then seq` with no `else`)
 without disturbing multi-line `doSeqIndent` layout. -/
@@ -244,10 +240,18 @@ private def emitOneArmedDoIfBranch (anchorTok seq : Syntax) (nesting : Nat) : In
           let col ← colOf a
           addWrap a.byteIdx b.byteIdx s!"leancov_hit% {tId};\n{spaces col}" s!"\n{spaces anchorCol}else \{ leancov_hit% {fId}; pure () }"
         else
-          addWrap a.byteIdx b.byteIdx s!"leancov_hit% {tId}; " s!"\n{spaces anchorCol}else \{ leancov_hit% {fId}; pure () }"
+          let seqCol ←
+            if seq.getKind == `Lean.Parser.Term.doSeqIndent && seq.getNumArgs ≥ 1 && (seq.getArg 0).getNumArgs > 1 then
+              colOf a
+            else pure (anchorCol + 2)
+          addWrap a.byteIdx b.byteIdx s!"\n{spaces seqCol}leancov_hit% {tId};\n{spaces seqCol}" s!"\n{spaces anchorCol}else \{ leancov_hit% {fId}; pure () }"
       else
-        addWrap a.byteIdx b.byteIdx "{ " s!" } else \{ leancov_hit% {fId}; pure () }"
-        addWrap a.byteIdx b.byteIdx s!"leancov_hit% {tId}; "
+        if ← isLineStart a.byteIdx then
+          let col ← colOf a
+          addWrap a.byteIdx b.byteIdx s!"\{\n{spaces col}leancov_hit% {tId};\n{spaces col}" s!" } else \{ leancov_hit% {fId}; pure () }"
+        else
+          addWrap a.byteIdx b.byteIdx "{ " s!" } else \{ leancov_hit% {fId}; pure () }"
+          addWrap a.byteIdx b.byteIdx s!"leancov_hit% {tId}; "
         addSemisBetweenDoItems seq
     else
       -- Single-line `thenSeq`
@@ -264,23 +268,27 @@ private def emitTermWrap (term : Syntax) (kind : BranchKind) (nesting : Nat) : I
     else
       addWrap a.byteIdx b.byteIdx s!"(leancov_term% {id} (" "))"
 
-private def skipWalkKind (k : SyntaxNodeKind) : Bool :=
-  k == `Lean.Parser.Term.byTactic ||
-  k == `Lean.Parser.Term.typeSpec ||
-  k == `Lean.Parser.Termination.suffix ||
-  k == `Lean.Parser.Command.declModifiers ||
-  k == `Lean.Parser.Term.explicitBinder ||
-  k == `Lean.Parser.Term.implicitBinder ||
-  k == `Lean.Parser.Term.strictImplicitBinder ||
-  k == `Lean.Parser.Term.instBinder ||
-  k == `Lean.Parser.Term.have ||
-  k == `Lean.Parser.Term.doHave ||
-  k == `Lean.Parser.Term.suffices ||
-  k == `Lean.Parser.Term.quotedName ||
-  k == `Lean.Parser.Term.doubleQuotedName ||
-  k == `Lean.Parser.Term.syntaxQuotation ||
-  k == `Lean.Parser.Term.stxQuot ||
-  k == `Lean.Parser.Term.dynamicQuot
+private def skippedWalkKinds : Array SyntaxNodeKind := #[
+  `Lean.Parser.Term.byTactic,
+  `Lean.Parser.Term.typeSpec,
+  `Lean.Parser.Termination.suffix,
+  `Lean.Parser.Command.declModifiers,
+  `Lean.Parser.Term.explicitBinder,
+  `Lean.Parser.Term.implicitBinder,
+  `Lean.Parser.Term.strictImplicitBinder,
+  `Lean.Parser.Term.instBinder,
+  `Lean.Parser.Term.have,
+  `Lean.Parser.Term.doHave,
+  `Lean.Parser.Term.suffices,
+  `Lean.Parser.Term.quotedName,
+  `Lean.Parser.Term.doubleQuotedName,
+  `Lean.Parser.Term.syntaxQuotation,
+  `Lean.Parser.Term.stxQuot,
+  `Lean.Parser.Term.dynamicQuot
+]
+
+def skipWalkKind (k : SyntaxNodeKind) : Bool :=
+  skippedWalkKinds.contains k
 
 mutual
 
@@ -501,22 +509,28 @@ private partial def walkBody (stx : Syntax) (nesting : Nat) : InstM Unit := do
 
 end
 
+private def skipModTokens : Array String :=
+  #["@[extern", "noncomputable", "meta ", "\nmeta ", "macro", "unsafe "]
+
 /-- Detect modifiers that mean a declaration is compile-time/proof/extern only and should not be instrumented. -/
-private def shouldSkipModifiers (mods : Syntax) (src : String) : Bool :=
+def shouldSkipModifiers (mods : Syntax) (src : String) : Bool :=
   match mods.getPos?, mods.getTailPos? with
   | some a, some b =>
     let bytes := src.toUTF8
     let txt := String.fromUTF8! (bytes.extract a.byteIdx (min b.byteIdx bytes.size))
-    let has (w : String) := (txt.splitOn w).length > 1
-    has "@[extern" || has "noncomputable" || has "meta " || has "\nmeta " || has "macro" || has "unsafe "
+    skipModTokens.any fun w => (txt.splitOn w).length > 1
   | _, _ => false
 
 private partial def findTypeSpec (s : Syntax) : Option Syntax :=
   if s.getKind == `Lean.Parser.Term.typeSpec then some s
   else s.getArgs.findSome? findTypeSpec
 
+private def nonCompPrefixes : Array String :=
+  #["Type ", "Sort", "Decidable", "Nonempty", "Subsingleton", "Inhabited",
+    "Lean.Elab.", "Elab.", "CommandElab", "TermElab", "Macro"]
+
 /-- Return `true` when a declaration's explicit return type is obviously non-computational (`Prop`, `Type`, `Sort`, `Decidable`). -/
-private def isNonComputationalSig (sig : Syntax) (src : String) : Bool :=
+def isNonComputationalSig (sig : Syntax) (src : String) : Bool :=
   match findTypeSpec sig with
   | none => false
   | some ts =>
@@ -528,27 +542,24 @@ private def isNonComputationalSig (sig : Syntax) (src : String) : Bool :=
       let afterColon := (raw.drop 1).toString.trimAscii.copy
       let parts := afterColon.splitOn "→"
       let last := (parts.getLast?.getD afterColon).splitOn "->" |>.getLast?.getD afterColon |>.trimAscii.copy
-      last == "Prop" || last == "Type" || last.startsWith "Type " || last.startsWith "Sort" ||
-      last.startsWith "Decidable" || last.startsWith "Nonempty" || last.startsWith "Subsingleton" ||
-      last.startsWith "Inhabited" || last.startsWith "Lean.Elab." || last.startsWith "Elab." ||
-      last.startsWith "CommandElab" || last.startsWith "TermElab" || last.startsWith "Macro"
+      last == "Prop" || last == "Type" || nonCompPrefixes.any (fun p => last.startsWith p)
     | _, _ => false
 
 /-- Check whether `valStx` has a `by` tactic proof as its top-level body. -/
-private def isTacticBody (valStx : Syntax) : Bool :=
+def isTacticBody (valStx : Syntax) : Bool :=
   match valStx.getKind with
   | `Lean.Parser.Command.declValSimple =>
     valStx.getNumArgs ≥ 2 && (valStx.getArg 1).getKind == `Lean.Parser.Term.byTactic
   | _ => false
 
-private def declIdName (idStx : Syntax) : String :=
+def declIdName (idStx : Syntax) : String :=
   if idStx.getNumArgs ≥ 1 then
     match idStx.getArg 0 with
     | .ident _ _ n _ => n.toString
     | _ => "<anon>"
   else "<anon>"
 
-private def qualifyName (ns : List String) (name : String) : String :=
+def qualifyName (ns : List String) (name : String) : String :=
   if ns.isEmpty || name.startsWith "_root_." then name
   else ".".intercalate (ns.reverse ++ [name])
 
@@ -567,34 +578,70 @@ private def basicFunRhs? (body : Syntax) : Option Syntax :=
     else none
   else none
 
+/-- Extract `(rawName, sigStx, valStx)` from a `def`, `instance` (or optionally `abbrev`) syntax node. -/
+def extractDeclHead? (inner : Syntax) (src : String) (allowAbbrev : Bool := false) :
+    Option (String × Syntax × Syntax) :=
+  let k := inner.getKind
+  let isDefLike := k == `Lean.Parser.Command.definition || (allowAbbrev && k == `Lean.Parser.Command.abbrev)
+  if isDefLike && inner.getNumArgs ≥ 4 then
+    some (declIdName (inner.getArg 1), inner.getArg 2, inner.getArg 3)
+  else if k == `Lean.Parser.Command.instance && inner.getNumArgs ≥ 5 then
+    let idOpt := inner.getArg 3
+    let sig := inner.getArg 4
+    let val := inner.getArg 5
+    let nm :=
+      if idOpt.getNumArgs ≥ 1 then declIdName (idOpt.getArg 0)
+      else
+        let sigTxt := match sig.getPos?, sig.getTailPos? with
+          | some a, some b => String.fromUTF8! (src.toUTF8.extract a.byteIdx (min b.byteIdx src.toUTF8.size))
+          | _, _ => ""
+        let clean := (sigTxt.replace "\n" " ").trimAscii.copy
+        let short := String.ofList (clean.toList.take 48)
+        s!"(instance {short})"
+    some (nm, sig, val)
+  else none
+
+/-- Attach `.fnEntry` to a 0-branch callable body (`do`, `fun x => ...`, or binder-bearing RHS). -/
+private def emitCallableEntryProbe (body : Syntax) (hasBinders : Bool) : InstM Bool := do
+  if body.getKind == `Lean.Parser.Term.do && body.getNumArgs ≥ 2 then
+    emitDoProbe_ (body.getArg 1) .fnEntry 0
+    return true
+  else if let some lamRhs := basicFunRhs? body then
+    emitTermWrap lamRhs .fnEntry 0
+    return true
+  else if hasBinders then
+    emitTermWrap body .fnEntry 0
+    return true
+  else
+    return false
+
+private def instrumentWhereField (field : Syntax) (src : String) : InstM Unit := do
+  unless field.getKind == `Lean.Parser.Term.structInstField && field.getNumArgs ≥ 2 do
+    walkBody field 0
+    return
+  let rhsSpec := field.getArg (field.getNumArgs - 1)
+  let before := (← get).declSiteIds.size
+  walkBody rhsSpec 0
+  if (← get).declSiteIds.size == before && rhsSpec.getNumArgs ≥ 3 && !isNonComputationalSig rhsSpec src then
+    let hasBinders := (rhsSpec.getArg 0).getNumArgs > 0
+    let defNode := rhsSpec.getArg 2
+    if defNode.getKind == `Lean.Parser.Term.structInstFieldDef && defNode.getNumArgs ≥ 3 then
+      let _ ← emitCallableEntryProbe (defNode.getArg (defNode.getNumArgs - 1)) hasBinders
+
+private def instrumentWhereStructInst (valStx : Syntax) (src : String) : InstM Unit := do
+  for child in valStx.getArgs do
+    if child.getKind == `Lean.Parser.Term.structInstFields && child.getNumArgs ≥ 1 then
+      for f in (child.getArg 0).getArgs do
+        instrumentWhereField f src
+    else
+      walkBody child 0
+
 /-- Instrument one `def` or `instance` declaration, returning its `FuncInfo` if eligible. -/
 private def instrumentDecl (ns : List String) (cmd : Syntax) (mods inner : Syntax) : InstM (Option FuncInfo) := do
   let s ← get
   if shouldSkipModifiers mods s.src then return none
-  let k := inner.getKind
-  let isDef := k == `Lean.Parser.Command.definition
-  let isInst := k == `Lean.Parser.Command.instance
-  unless isDef || isInst do return none
-  -- Extract name, optDeclSig, declVal
-  let (rawName, sigStx, valStx) ←
-    if isDef && inner.getNumArgs ≥ 4 then
-      pure (declIdName (inner.getArg 1), inner.getArg 2, inner.getArg 3)
-    else if isInst && inner.getNumArgs ≥ 5 then
-      -- `instance`: #[attr?, "instance", prio?, declIdOpt, optDeclSig, declVal]
-      let idOpt := inner.getArg 3
-      let sig := inner.getArg 4
-      let val := inner.getArg 5
-      let nm :=
-        if idOpt.getNumArgs ≥ 1 then declIdName (idOpt.getArg 0)
-        else
-          let sigTxt := match sig.getPos?, sig.getTailPos? with
-            | some a, some b => String.fromUTF8! (s.src.toUTF8.extract a.byteIdx (min b.byteIdx s.src.toUTF8.size))
-            | _, _ => ""
-          let clean := (sigTxt.replace "\n" " ").trimAscii.copy
-          let short := String.ofList (clean.toList.take 48)
-          s!"(instance {short})"
-      pure (nm, sig, val)
-    else return none
+  let some (rawName, sigStx, valStx) := extractDeclHead? inner s.src | return none
+  let isDef := inner.getKind == `Lean.Parser.Command.definition
   if isNonComputationalSig sigStx s.src then return none
   if isTacticBody valStx then return none
   -- Compute complexity and line range from original AST
@@ -618,19 +665,13 @@ private def instrumentDecl (ns : List String) (cmd : Syntax) (mods inner : Synta
       -- Skip pure 0-arg constants/CAFs (e.g. `def nonceSize := 12`, `instance : Foo := ⟨...⟩`)
       -- so module initializers never inflate function/branch coverage.
       if (← get).declSiteIds.isEmpty then
-        if body.getKind == `Lean.Parser.Term.do && body.getNumArgs ≥ 2 then
-          emitDoProbe_ (body.getArg 1) .fnEntry 0
-        else if let some lamRhs := basicFunRhs? body then
-          emitTermWrap lamRhs .fnEntry 0
-        else if isDef && hasSigBinders sigStx then
-          emitTermWrap body .fnEntry 0
-        else
-          isPureConstant := true
+        let emitted ← emitCallableEntryProbe body (isDef && hasSigBinders sigStx)
+        if !emitted then isPureConstant := true
   | `Lean.Parser.Command.declValEqns =>
     walkBody valStx 0
   | `Lean.Parser.Command.whereStructInst =>
-    -- `instance : Foo where f := ...` — instrument each field's RHS
-    walkBody valStx 0
+    -- `instance : Foo where f := ...` — instrument each field's RHS and callable 0-branch fields
+    instrumentWhereStructInst valStx s.src
     if (← get).declSiteIds.isEmpty then
       isPureConstant := true
   | _ => pure ()
@@ -673,7 +714,7 @@ private def popScope (scopeStack : List (Bool × List String)) (ns : List String
   | (isNs, parts) :: rest => (rest, if isNs then ns.drop parts.length else ns)
   | [] => ([], [])
 
-private def stepScope? (cmd : Syntax) (scopeStack : List (Bool × List String)) (ns : List String) :
+def stepScope? (cmd : Syntax) (scopeStack : List (Bool × List String)) (ns : List String) :
     Option (List (Bool × List String) × List String) :=
   match cmd.getKind with
   | `Lean.Parser.Command.namespace => some (pushNamespaceScope cmd scopeStack ns)
@@ -727,59 +768,28 @@ structure FileResult where
   functions : Array FuncInfo
   nextSiteId : Nat
   skippedReason : Option String := none
+  armedMain : Bool := false
 
-/-- Parse and instrument a single `.lean` file in memory using parser environment `env`. -/
-def instrumentSource (env : Environment) (relFile src : String) (startSiteId : Nat)
-    (cfg : InstrumentConfig := {}) : IO FileResult := do
-  let ic := mkInputContext src relFile
-  let (hdr, pstate, msgs0) ← parseHeader ic
-  if msgs0.hasErrors then
-    let err ← msgs0.toList.mapM (·.toString)
-    return { instrumented := src, sites := #[], functions := #[], nextSiteId := startSiteId,
-             skippedReason := some ("header parse error: " ++ "; ".intercalate err) }
-  let pmctx : ParserModuleContext := { env, options := {} }
+/-- Parse commands one by one with isolated per-command `MessageLog`s so a single custom macro
+or tactic command does not force skipping the rest of a valid file. -/
+def parseCommandsResilient (ic : InputContext) (pmctx : ParserModuleContext) (pstate : ModuleParserState) :
+    IO (Array (Syntax × Bool) × Array String) := do
   let mut ps := pstate
-  let mut msgs := msgs0
-  let mut cmds : Array Syntax := #[]
+  let mut cmds : Array (Syntax × Bool) := #[]
+  let mut errMsgs : Array String := #[]
   repeat
-    let (cmd, ps', msgs') := parseCommand ic pmctx ps msgs
+    let prevPos := ps.pos
+    let (cmd, ps', cmdMsgs) := parseCommand ic pmctx ps {}
     ps := ps'
-    msgs := msgs'
     if isTerminalCommand cmd then break
-    cmds := cmds.push cmd
-  if msgs.hasErrors then
-    let err ← msgs.toList.filter (·.severity == .error) |>.mapM (·.toString)
-    return { instrumented := src, sites := #[], functions := #[], nextSiteId := startSiteId,
-             skippedReason := some ("parse error: " ++ "; ".intercalate (err.take 2)) }
-  let initState : FileState := {
-    file := relFile, src, fileMap := ic.fileMap, nextSiteId := startSiteId,
-    instrumentBoolOps := cfg.instrumentBoolOps
-  }
-  let run : InstM (Array FuncInfo) := do
-    let mut scopeStack : List (Bool × List String) := []
-    let mut ns : List String := []
-    let mut funcs : Array FuncInfo := #[]
-    for cmd in cmds do
-      let (ss, ns', fs) ← walkCommand cmd scopeStack ns funcs
-      scopeStack := ss
-      ns := ns'
-      funcs := fs
-    return funcs
-  let (funcs, st) := run.run initState
-  if cfg.analyzeOnly || st.edits.isEmpty then
-    return { instrumented := src, sites := st.sites, functions := funcs, nextSiteId := st.nextSiteId }
-  -- Inject `import LeanCov.DoSyntax` immediately after the module header
-  let hdrEnd := (hdr.raw.getTailPos?.map (·.byteIdx)).getD 0
-  let importLine :=
-    if headerIsModule hdr.raw then
-      if hdrEnd == 0 then "public import LeanCov.DoSyntax\n" else "\npublic import LeanCov.DoSyntax\n"
-    else
-      if hdrEnd == 0 then "import LeanCov.DoSyntax\n" else "\nimport LeanCov.DoSyntax\n"
-  let headerEdit : Edit := { startPos := hdrEnd, endPos := hdrEnd, seq := 0, openText := importLine }
-  -- Shift existing edit sequences so headerEdit is first if hdrEnd == 0
-  let shifted := st.edits.map fun e => { e with seq := e.seq + 1 }
-  let rewritten := applyEdits src (#[headerEdit] ++ shifted)
-  return { instrumented := rewritten, sites := st.sites, functions := funcs, nextSiteId := st.nextSiteId }
+    let hasErr := cmdMsgs.hasErrors
+    if hasErr && errMsgs.size < 2 then
+      let es ← cmdMsgs.toList.filter (·.severity == .error) |>.mapM (·.toString)
+      for e in es do
+        if errMsgs.size < 2 then errMsgs := errMsgs.push e
+    cmds := cmds.push (cmd, hasErr)
+    if ps'.pos ≤ prevPos then break
+  return (cmds, errMsgs)
 
 private def wrapMainExpr (fileMap : FileMap) (e : Syntax) (acc : Array Edit) : Array Edit :=
   match e.getPos?, e.getTailPos? with
@@ -800,13 +810,27 @@ private partial def wrapMainEqns (fileMap : FileMap) (s : Syntax) (acc : Array E
   | .node _ _ args => args.foldl (fun a c => wrapMainEqns fileMap c a) acc
   | _ => acc
 
-private def collectMainDeclEdits (fileMap : FileMap) (cmd : Syntax) (ns : List String)
+/-- Check if `ns.reverse` matches the trailing module path components of `relFile`
+(for Lake executables with `root := Foo.Bar` where `def main` lives inside `namespace Foo.Bar`). -/
+private def nsMatchesFileModule (relFile : String) (ns : List String) : Bool :=
+  let modNs := ns.reverse
+  let norm := relFile.replace "\\" "/"
+  let stem := if norm.endsWith ".lean" then (norm.dropEnd 5).toString else norm
+  let parts := (stem.splitOn "/").filter (!·.isEmpty)
+  !modNs.isEmpty && modNs.length ≤ parts.length &&
+    parts.drop (parts.length - modNs.length) == modNs
+
+private def isEntryMainDecl (relFile : String) (ns : List String) (nm : String) : Bool :=
+  nm == "_root_.main" ||
+  (nm == "main" && (ns.isEmpty || nsMatchesFileModule relFile ns))
+
+private def collectMainDeclEdits (relFile : String) (fileMap : FileMap) (cmd : Syntax) (ns : List String)
     (edits : Array Edit) : Array Edit := Id.run do
   unless cmd.getNumArgs ≥ 2 do return edits
   let inner := cmd.getArg 1
   unless inner.getKind == `Lean.Parser.Command.definition && inner.getNumArgs ≥ 4 do return edits
   let nm := declIdName (inner.getArg 1)
-  unless (ns.isEmpty && nm == "main") || nm == "_root_.main" do return edits
+  unless isEntryMainDecl relFile ns nm do return edits
   let valStx := inner.getArg 3
   match valStx.getKind with
   | `Lean.Parser.Command.declValSimple =>
@@ -815,7 +839,7 @@ private def collectMainDeclEdits (fileMap : FileMap) (cmd : Syntax) (ns : List S
     wrapMainEqns fileMap valStx edits
   | _ => edits
 
-private partial def collectMainArmEdits (fileMap : FileMap) (cmd : Syntax)
+private partial def collectMainArmEdits (relFile : String) (fileMap : FileMap) (cmd : Syntax)
     (scopeStack : List (Bool × List String)) (ns : List String) (edits : Array Edit) :
     List (Bool × List String) × List String × Array Edit :=
   match stepScope? cmd scopeStack ns with
@@ -823,11 +847,95 @@ private partial def collectMainArmEdits (fileMap : FileMap) (cmd : Syntax)
   | none =>
     match cmd.getKind with
     | `Lean.Parser.Command.in =>
-      if cmd.getNumArgs ≥ 3 then collectMainArmEdits fileMap (cmd.getArg 2) scopeStack ns edits
+      if cmd.getNumArgs ≥ 3 then collectMainArmEdits relFile fileMap (cmd.getArg 2) scopeStack ns edits
+      else (scopeStack, ns, edits)
+    | `Lean.Parser.Command.mutual =>
+      if cmd.getNumArgs ≥ 2 then
+        let ed' := (cmd.getArg 1).getArgs.foldl
+          (fun acc d => (collectMainArmEdits relFile fileMap d scopeStack ns acc).2.2) edits
+        (scopeStack, ns, ed')
       else (scopeStack, ns, edits)
     | `Lean.Parser.Command.declaration =>
-      (scopeStack, ns, collectMainDeclEdits fileMap cmd ns edits)
+      (scopeStack, ns, collectMainDeclEdits relFile fileMap cmd ns edits)
     | _ => (scopeStack, ns, edits)
+
+private def collectAllMainArmEdits (relFile : String) (fileMap : FileMap)
+    (cmds : Array (Syntax × Bool)) : Array Edit := Id.run do
+  let mut scopeStack : List (Bool × List String) := []
+  let mut ns : List String := []
+  let mut edits : Array Edit := #[]
+  for (cmd, hasErr) in cmds do
+    if hasErr then
+      if let some (ss, ns') := stepScope? cmd scopeStack ns then
+        scopeStack := ss
+        ns := ns'
+    else
+      let (ss, ns', ed) := collectMainArmEdits relFile fileMap cmd scopeStack ns edits
+      scopeStack := ss
+      ns := ns'
+      edits := ed
+  return edits
+
+private def mkHeaderImportEdit (hdrRaw : Syntax) (modName : String) : Edit :=
+  let hdrEnd := (hdrRaw.getTailPos?.map (·.byteIdx)).getD 0
+  let pfx := if headerIsModule hdrRaw then "public import " else "import "
+  let line := if hdrEnd == 0 then s!"{pfx}{modName}\n" else s!"\n{pfx}{modName}\n"
+  { startPos := hdrEnd, endPos := hdrEnd, seq := 0, openText := line }
+
+/-- Parse and instrument a single `.lean` file in memory using parser environment `env`. -/
+def instrumentSource (env : Environment) (relFile src : String) (startSiteId : Nat)
+    (cfg : InstrumentConfig := {}) : IO FileResult := do
+  let ic := mkInputContext src relFile
+  let (hdr, pstate, msgs0) ← parseHeader ic
+  if msgs0.hasErrors then
+    let err ← msgs0.toList.mapM (·.toString)
+    return { instrumented := src, sites := #[], functions := #[], nextSiteId := startSiteId,
+             skippedReason := some ("header parse error: " ++ "; ".intercalate err) }
+  let pmctx : ParserModuleContext := { env, options := {} }
+  let (cmds, errMsgs) ← parseCommandsResilient ic pmctx pstate
+  if !cmds.isEmpty && cmds.all (·.2) then
+    return { instrumented := src, sites := #[], functions := #[], nextSiteId := startSiteId,
+             skippedReason := some ("parse error: " ++ "; ".intercalate errMsgs.toList) }
+  let initState : FileState := {
+    file := relFile, src, fileMap := ic.fileMap, nextSiteId := startSiteId,
+    instrumentBoolOps := cfg.instrumentBoolOps
+  }
+  let run : InstM (Array FuncInfo) := do
+    let mut scopeStack : List (Bool × List String) := []
+    let mut ns : List String := []
+    let mut funcs : Array FuncInfo := #[]
+    for (cmd, hasErr) in cmds do
+      if hasErr then
+        if let some (ss, ns') := stepScope? cmd scopeStack ns then
+          scopeStack := ss
+          ns := ns'
+      else
+        let (ss, ns', fs) ← walkCommand cmd scopeStack ns funcs
+        scopeStack := ss
+        ns := ns'
+        funcs := fs
+    return funcs
+  let (funcs, st) := run.run initState
+  if cfg.analyzeOnly then
+    return { instrumented := src, sites := st.sites, functions := funcs, nextSiteId := st.nextSiteId }
+  let armEdits :=
+    if cfg.armMains && (src.splitOn "main").length > 1 then
+      collectAllMainArmEdits relFile ic.fileMap cmds
+    else #[]
+  let armedMain := !armEdits.isEmpty
+  if st.edits.isEmpty && armEdits.isEmpty then
+    return { instrumented := src, sites := st.sites, functions := funcs, nextSiteId := st.nextSiteId }
+  let alreadyHasRuntime :=
+    (src.splitOn "import LeanCov.DoSyntax").length > 1 ||
+    (src.splitOn "import LeanCov.Runtime").length > 1
+  let headerEdits :=
+    if !st.edits.isEmpty then #[mkHeaderImportEdit hdr.raw "LeanCov.DoSyntax"]
+    else if alreadyHasRuntime then #[]
+    else #[mkHeaderImportEdit hdr.raw "LeanCov.Runtime"]
+  let shifted := st.edits.map fun e => { e with seq := e.seq + 1 + armEdits.size }
+  let rewritten := applyEdits src (headerEdits ++ armEdits ++ shifted)
+  return { instrumented := rewritten, sites := st.sites, functions := funcs,
+           nextSiteId := st.nextSiteId, armedMain }
 
 /-- Inject `LeanCov.arm ()` at entry to top-level `def main` so `LEAN_COV_DEFER_INIT=1` ignores
 all probe hits fired during module initialization (`initialize_*`) before `main` begins. -/
@@ -837,39 +945,21 @@ def armMainInSource (env : Environment) (relFile src : String) : IO (String × B
   let (hdr, pstate, msgs0) ← parseHeader ic
   if msgs0.hasErrors then return (src, false)
   let pmctx : ParserModuleContext := { env, options := {} }
-  let mut ps := pstate
-  let mut msgs := msgs0
-  let mut cmds : Array Syntax := #[]
-  repeat
-    let (cmd, ps', msgs') := parseCommand ic pmctx ps msgs
-    ps := ps'
-    msgs := msgs'
-    if isTerminalCommand cmd then break
-    cmds := cmds.push cmd
-  if msgs.hasErrors then return (src, false)
-  let mut scopeStack : List (Bool × List String) := []
-  let mut ns : List String := []
-  let mut edits : Array Edit := #[]
-  for cmd in cmds do
-    let (ss, ns', ed) := collectMainArmEdits ic.fileMap cmd scopeStack ns edits
-    scopeStack := ss
-    ns := ns'
-    edits := ed
+  let (cmds, _) ← parseCommandsResilient ic pmctx pstate
+  let edits := collectAllMainArmEdits relFile ic.fileMap cmds
   if edits.isEmpty then return (src, false)
   let alreadyImports :=
     (src.splitOn "import LeanCov.DoSyntax").length > 1 ||
     (src.splitOn "import LeanCov.Runtime").length > 1
   let allEdits :=
     if alreadyImports then edits
-    else
-      let hdrEnd := (hdr.raw.getTailPos?.map (·.byteIdx)).getD 0
-      let importLine :=
-        if headerIsModule hdr.raw then
-          if hdrEnd == 0 then "public import LeanCov.Runtime\n" else "\npublic import LeanCov.Runtime\n"
-        else
-          if hdrEnd == 0 then "import LeanCov.Runtime\n" else "\nimport LeanCov.Runtime\n"
-      #[{ startPos := hdrEnd, endPos := hdrEnd, seq := 0, openText := importLine }] ++ edits
+    else #[mkHeaderImportEdit hdr.raw "LeanCov.Runtime"] ++ edits
   return (applyEdits src allEdits, true)
+
+private def ignoredDirNames : Array String := #[".git", ".lake", "build"]
+
+def isIgnoredDirName (name : String) : Bool :=
+  ignoredDirNames.contains name
 
 /-- Recursively collect all `.lean` files under `dir`, sorted deterministically. -/
 partial def collectLeanFiles (dir : System.FilePath) : IO (Array System.FilePath) := do
@@ -878,8 +968,7 @@ partial def collectLeanFiles (dir : System.FilePath) : IO (Array System.FilePath
   for entry in (← dir.readDir) do
     let p := entry.path
     if ← p.isDir then
-      let name := entry.fileName
-      if name == ".lake" || name == ".git" || name == "build" then continue
+      if isIgnoredDirName entry.fileName then continue
       out := out ++ (← collectLeanFiles p)
     else if p.extension == some "lean" then
       out := out.push p
@@ -888,35 +977,60 @@ partial def collectLeanFiles (dir : System.FilePath) : IO (Array System.FilePath
 private def isExcluded (rel : String) (excludes : Array String) : Bool :=
   excludes.any fun pat => !pat.isEmpty && (rel.splitOn pat).length > 1
 
-private def relativeTo (base file : System.FilePath) : String :=
+def relativeTo (base file : System.FilePath) : String :=
   let b := base.toString
   let f := file.toString
   let pfx := if b.endsWith "/" then b else b ++ "/"
   if f.startsWith pfx then (f.drop pfx.length).toString else f
 
+private def queryLeanPrefix? (args : Array String) (cwd? : Option System.FilePath := none) :
+    IO (Option System.FilePath) := do
+  let out ← try IO.Process.output { cmd := "lean", args := args, cwd := cwd? }
+            catch _ => pure { exitCode := 1, stdout := "", stderr := "" }
+  if out.exitCode == 0 then
+    let p := out.stdout.trimAscii.copy
+    if !p.isEmpty then return some ⟨p⟩
+  return none
+
 /-- Locate the Lean sysroot matching this `leancov` binary, even when invoked outside a project
-directory with no `elan` default toolchain configured. -/
-private def resolveSysroot : IO System.FilePath := do
-  if let some sr ← IO.getEnv "LEAN_SYSROOT" then
+directory with no `elan` default toolchain configured or copied standalone onto `PATH`. -/
+def resolveSysroot (startDir? : Option System.FilePath := none) (envOverride? : Option String := none) :
+    IO System.FilePath := do
+  let srOpt ← match envOverride? with
+    | some s => pure (some s)
+    | none => IO.getEnv "LEAN_SYSROOT"
+  if let some sr := srOpt then
     if !sr.isEmpty then return ⟨sr⟩
   -- Walk up from `leancov`'s own binary to find its `lean-toolchain` so `Init.olean` matches our build.
-  let mut dir? := (← IO.appPath).parent
+  let mut dir? ← match startDir? with
+    | some d => pure (some d)
+    | none => pure (← IO.appPath).parent
   for _ in [:8] do
     let some d := dir? | break
     if ← (d / "lean-toolchain").pathExists then
-      let out ← IO.Process.output { cmd := "lean", args := #["--print-prefix"], cwd := some d }
-      if out.exitCode == 0 then
-        let p := out.stdout.trimAscii.copy
-        if !p.isEmpty then return ⟨p⟩
+      if let some p ← queryLeanPrefix? #["--print-prefix"] (some d) then
+        return p
     dir? := d.parent
+  -- Standalone copied binary fallback: query `elan` for the exact Lean version compiled into `leancov`.
+  for tc in #[s!"+leanprover/lean4:v{Lean.versionString}", s!"+v{Lean.versionString}"] do
+    if let some p ← queryLeanPrefix? #[tc, "--print-prefix"] then
+      return p
   findSysroot
 
-/-- Build a Lean parser environment loading `Init` plus any extra syntax-providing modules. -/
+private initialize parserEnvCache : IO.Ref (Array (Array Name × Environment)) ← IO.mkRef #[]
+
+/-- Build (and memoize) a Lean parser environment loading `Init` plus any extra syntax-providing modules. -/
 unsafe def loadParserEnv (extraImports : Array Name := #[]) : IO Environment := do
+  let norm := extraImports.filter (· != `Init)
+  let cached ← parserEnvCache.get
+  if let some (_, env) := cached.find? (fun (k, _) => k == norm) then
+    return env
   enableInitializersExecution
   initSearchPath (← resolveSysroot)
-  let mods := #[{ module := `Init }] ++ extraImports.map fun m => { module := m }
-  importModules mods {} (loadExts := true)
+  let mods := #[{ module := `Init }] ++ norm.map fun m => { module := m }
+  let env ← importModules mods {} (loadExts := true)
+  parserEnvCache.modify (·.push (norm, env))
+  return env
 
 /-- Instrument all `.lean` files in `srcRoot` into `outRoot`, returning the combined `Manifest`.
 When `armMains` is true, top-level `def main` entry points (even in excluded files) are armed
@@ -942,17 +1056,16 @@ unsafe def instrumentTree (srcRoot outRoot : System.FilePath) (cfg : InstrumentC
         if let some p := dest.parent then IO.FS.createDirAll p
         IO.FS.writeFile dest outSrc
       continue
-    let res ← instrumentSource env relDisplay src nextId cfg
+    let res ← instrumentSource env relDisplay src nextId { cfg with armMains := armMains }
     nextId := res.nextSiteId
     allSites := allSites ++ res.sites
     allFuncs := allFuncs ++ res.functions
     if let some why := res.skippedReason then
       skipped := skipped.push (relDisplay, why)
+    if res.armedMain then armedAny := true
     unless cfg.analyzeOnly do
-      let (outSrc, armed) ← if armMains then armMainInSource env relDisplay res.instrumented else pure (res.instrumented, false)
-      if armed then armedAny := true
       if let some p := dest.parent then IO.FS.createDirAll p
-      IO.FS.writeFile dest outSrc
+      IO.FS.writeFile dest res.instrumented
   return { version := 1, armOnMain := armedAny, sites := allSites, functions := allFuncs, skippedFiles := skipped }
 
 end LeanCov.Cov

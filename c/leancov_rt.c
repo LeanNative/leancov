@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -95,7 +96,10 @@ static void leancov_init_impl(void) {
         memcpy(hdr, LEANCOV_MAGIC, 8);
         uint64_t n = (uint64_t)sites;
         memcpy(hdr + 8, &n, 8);
-        (void)pwrite(fd, hdr, LEANCOV_HEADER_BYTES, 0);
+        if (pwrite(fd, hdr, LEANCOV_HEADER_BYTES, 0) != (ssize_t)LEANCOV_HEADER_BYTES) {
+            close(fd);
+            return;
+        }
     }
 
     void *map = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -140,4 +144,20 @@ LEAN_EXPORT lean_object *leancov_pass(size_t site, lean_object *x) {
 LEAN_EXPORT uint8_t leancov_mark(size_t site) {
     leancov_bump(site);
     return 1;
+}
+
+LEAN_EXPORT lean_object *leancov_raise_stack(lean_object *unit) {
+    (void)unit;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0) {
+        rlim_t target = (rlim_t)(64ULL * 1024ULL * 1024ULL);
+        if (rl.rlim_max != RLIM_INFINITY && target > rl.rlim_max) {
+            target = rl.rlim_max;
+        }
+        if (rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < target) {
+            rl.rlim_cur = target;
+            if (setrlimit(RLIMIT_STACK, &rl) != 0) {}
+        }
+    }
+    return lean_io_result_mk_ok(lean_box(0));
 }

@@ -1,13 +1,13 @@
 # leancov
 
-Source-level branch & line coverage, McCabe CRAP, SonarSource-style Cognitive Complexity, and a lightweight test/fuzzing kit for Lean 4.
+Source-level branch & line coverage, McCabe CRAP, SonarSource-style Cognitive Complexity, AST-guided mutation testing, and a lightweight test/fuzzing kit for Lean 4.
 
 Unlike C-level (`clang -fprofile-instr-generate`) coverage over Lean's generated C, `leancov` parses `.lean` files with Lean's own parser, injects minimal source-level probes into a staged out-of-tree copy, and records branch hits via a tiny POSIX C `mmap(MAP_SHARED)` runtime. That means:
 
 - **Zero C codegen noise & zero startup inflation** — no reference-counting reuse checks (`isShared`), monad bind plumbing, boxed trampolines, or inlined-away functions; pure 0-arg constants/CAFs are excluded, `leancov stage` arms `def main` with `LEAN_COV_DEFER_INIT=1` so module initializers produce 0.0% startup coverage, and `@[never_extract]` prevents Lean's compiler from hoisting constant-returning probes into `lean_once_cell_t` caches.
 - **Strict branch vs. function separation** — top-level branch coverage and LCOV `BRDA`/`BRF`/`BRH` count only genuine control-flow and boolean-operand outcomes (including `for`/`while` 0-iteration `loop.skip` and terminal `&&`/`||` RHS operands), never straight-line `fn.entry` probes.
 - **Crash- and `SIGKILL`-safe counters** — atomic 64-bit increments directly into a shared memory-mapped `.cov` file survive panics, multi-process tests, and killed child processes.
-- **No `Lean` runtime dependency in tested binaries** — `LeanCov.Runtime` has zero `Lean` imports, and `LeanCov.DoSyntax` uses `public meta import Lean` so instrumented executables link cleanly without `supportInterpreter := true`.
+- **No `Lean` runtime dependency in tested binaries** — `LeanCov.Runtime` has zero `Lean` imports, and `LeanCov.DoSyntax` uses `public meta import Lean.Elab.Do` so instrumented executables link cleanly without `supportInterpreter := true`.
 - **Kernel & recursion compatible** — probes elaborate eagerly preserving `expectedType?`, metavariable order, `let mut`/`return`/`continue`/`break`, `Prop` erasure, `termination_by`, and structural recursion (`brecOn`).
 - **McCabe CRAP + Cognitive CRAP** — alongside classic `CRAP = CC²·(1-cov)³ + CC`, `leancov` computes nesting-weighted Cognitive Complexity (`CogCRAP = Cog²·(1-cov)³ + Cog`) so flat `match` tables stay low while deeply nested untested logic surfaces first.
 - **Standard outputs** — terminal tables, machine-readable JSON, and standard **LCOV** (`.info`) for `genhtml`, Codecov, Coveralls, and IDE gutters.
@@ -26,9 +26,9 @@ Unlike C-level (`clang -fprofile-instr-generate`) coverage over Lean's generated
 | `LeanCov.Check` | Minimal test harness (`check`, `checkEq`, `fail`, `need`, `needE`, `refused`, `runTest`, `runMain`, `<EXE>_ONLY`) | None |
 | `LeanCov.Fuzz` | Deterministic SplitMix64 mutation fuzzer with `LEAN_ABORT_ON_PANIC=1` supervision, stall watchdog, and corpus replay | None |
 | `LeanCov.Runtime` | `@[extern]` probe primitives backed by `c/leancov_rt.c` (`libleancov_rt`) | None |
-| `LeanCov.DoSyntax` | Eager `leancov_hit%` (`doElem`) and `leancov_term%` (`term`) elaborators | Meta-only (`public meta import Lean`) |
-| `LeanCov.Cov` | AST complexity analyzer, byte-offset instrumenter, binary `.cov` I/O, JSON & LCOV reporter | Compiler/CLI only |
-| `leancov` CLI | Standalone CLI (`stage`, `instrument`, `run`, `report`, `analyze`, `--version`) | CLI binary |
+| `LeanCov.DoSyntax` | Eager `leancov_hit%` (`doElem`) and `leancov_term%` (`term`) elaborators | Meta-only (`public meta import Lean.Elab.Do`) |
+| `LeanCov.Cov` | AST complexity analyzer, byte-offset instrumenter, AST mutator, binary `.cov` I/O, JSON & LCOV reporter | Compiler/CLI only |
+| `leancov` CLI | Standalone CLI (`stage`, `instrument`, `run`, `report`, `analyze`, `mutate`, `--version`) | CLI binary |
 
 ## Installation
 
@@ -39,7 +39,7 @@ Unlike C-level (`clang -fprofile-instr-generate`) coverage over Lean's generated
 ```toml
 [[require]]
 name = "leancov"
-git = "https://github.com/<org>/leancov"
+git = "https://github.com/LeanNative/leancov"
 rev = "main" # or pin to a release tag / commit SHA
 ```
 
@@ -47,7 +47,7 @@ rev = "main" # or pin to a release tag / commit SHA
 
 ```lean
 require leancov from git
-  "https://github.com/<org>/leancov" @ "main"
+  "https://github.com/LeanNative/leancov" @ "main"
 ```
 
 For a local checkout or monorepo, use a path dependency instead:
@@ -75,7 +75,7 @@ lake exe leancov --version
 If you want to run `leancov` across any Lean project without adding it to every `lakefile`:
 
 ```sh
-git clone https://github.com/<org>/leancov
+git clone https://github.com/LeanNative/leancov
 cd leancov
 lake build leancov
 
@@ -156,6 +156,35 @@ leancov report \
 ```
 
 Sort modes: `--sort crap` (McCabe CRAP, default), `--sort cog` (Cognitive CRAP), `--sort cc` (McCabe CC), or `--sort uncov` (uncovered branch count). Generate browsable HTML from LCOV with `genhtml build/leancov-stage/lcov.info -o build/html`.
+
+### 5. AST-Guided Mutation Testing (`mutate`)
+
+`leancov mutate` parses computational declarations (`def`, `abbrev`, `instance`) with Lean's parser—skipping `theorem`s, `by` tactic proofs, type signatures, `termination_by` clauses, `have` obligations, attributes, and pattern binders—and evaluates semantics-changing mutants inside a clean out-of-tree staged copy:
+
+- **Comparison & equality flips:** `==` <-> `!=`, `<` <-> `≤`, `<=` -> `<`, `>` <-> `≥`, `>=` -> `>`
+- **Boolean operator flips:** `&&` <-> `||`
+- **Boolean literal flips:** `true` <-> `false` (`Bool.true` <-> `Bool.false`)
+- **Negation mutations:** `!x` -> `x` / `(x)` and `if c then` / `unless c do` -> `!(c)`
+
+```sh
+leancov mutate \
+  --pkg . \
+  --file MyLib/Policy.lean \
+  --filter authorize \
+  --build-target my-tests \
+  --timeout 30 \
+  --min-score 80.0 \
+  --json build/mutate.json \
+  -- .lake/build/bin/my-tests
+```
+
+Key flags & execution model:
+
+- `(--file <relFile> | --src-dir <relDir>)...` — select individual files or directories to mutate.
+- `--filter <declSubstr>` (repeatable or comma-separated) — restrict mutations to matching declaration names; `--max-mutants <N>` caps sample size.
+- `--build-target <lakeTarget>` (repeatable) — target(s) built per mutant inside the staged workspace (`--out <workDir>`, default `<pkgDir>/.lake/build/leancov-mutate`). Existing `.lake/packages/*` symlinks and `.lake/build/{ir,lib/lean,c}` caches are reused so incremental mutant builds stay fast.
+- **Outcome classification:** mutants rejected by Lean's typechecker (e.g., broken dependent bounds proofs like `if h : i < xs.size then xs[i]`) are classified as **`uncompilable` and excluded from the score denominator**; compiled mutants are run with a wall-clock `--timeout <sec>` (default `30`s), yielding `killed` (non-zero exit), `timeout` (killed on hang), or `survived` (zero exit).
+- **Mutation score:** `100 * (killed + timeout) / tested`, failing with exit code `1` if below `--min-score <pct>`. Pass `--keep-work` to retain `<workDir>` after completion.
 
 ### Multi-Package Workspaces
 
@@ -250,7 +279,14 @@ def main (args : List String) : IO UInt32 :=
 | `for`, `while` / `repeat` | `loop.body` + `loop.skip` (0 iterations) / `loop.body` |
 | `try ... catch` | `catch.body` |
 | `a && b`, `a \|\| b` (disable with `--no-bool-ops`) | `and.true`/`and.false`, `or.true`/`or.false` on every atomic operand (both LHS and RHS) |
-| Callable straight-line functions (0 branches, excludes pure 0-arg constants) | `fn.entry` (counted in function & line coverage, excluded from branch coverage) |
+| Callable straight-line functions & `instance ... where` fields (0 branches, excludes pure 0-arg constants) | `fn.entry` (counted in function & line coverage, excluded from branch coverage) |
+
+## Design Choices & Semantics
+
+- **`LEAN_COV_DEFER_INIT=1` + `main` arming:** `leancov stage` injects `LeanCov.arm ()` at entry to executable `def main` declarations (both top-level and inside the file's matching module namespace), and `leancov run` sets `LEAN_COV_DEFER_INIT=1` whenever `armOnMain: true`. Hits fired during `initialize_*` module startup before `main` runs are ignored so unexercised code never receives artificial startup coverage.
+- **Pure 0-arg CAF exclusion:** Zero-argument constant definitions (`def table := #[1, 2, 3]`) and pure-constant-only instances (`instance : Inhabited T where default := ...`) are excluded from function and branch denominators. Straight-line callable declarations (`def f (x : A) := ...`, point-free `fun` lambdas, `do` blocks, and callable `instance ... where` field implementations) receive an `fn.entry` probe that counts toward function/line coverage without inflating branch coverage.
+- **`where` helper definitions folded into enclosing declarations:** Local `where` helpers are traversed as part of their parent declaration, folding their probe sites and McCabe/Cognitive complexity into the enclosing function rather than reporting synthetic auxiliary names separately.
+- **Inline (non-line-start) `for`/`while` loops:** Line-start `for` and `while` loops allocate a local flag to record both `loop.body` and 0-iteration `loop.skip`. Inline loops that do not begin at the start of a line (e.g., `else for x in xs do ...` on a single line) record `loop.body` without `loop.skip` so surrounding indentation-sensitive layout is never disturbed.
 
 ## Runtime Environment Variables
 
@@ -280,7 +316,7 @@ Run a self-coverage dogfood pass on `leancov` itself:
 .lake/build/bin/leancov run --sites build/self-stage/sites.json --profile build/self-stage/self.cov --append \
   -- build/self-stage/.lake/build/bin/leancov-test
 .lake/build/bin/leancov report --sites build/self-stage/sites.json --profile build/self-stage/self.cov \
-  --files --kinds --sort cog --top 10
+  --files --kinds --sort cog --top 10 --min-cov 85
 rm -rf build/self-stage
 ```
 

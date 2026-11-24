@@ -1,4 +1,5 @@
 import Lean.Data.Json
+import LeanCov.Runtime
 import LeanCov.Cov
 
 /-! # `leancov` CLI
@@ -8,7 +9,8 @@ Subcommands:
 - `leancov stage`      — stage an entire Lake package into an out-of-tree instrumented build directory
 - `leancov run`        — execute a command with `LEAN_COV_FILE` / `LEAN_COV_SITES` initialized
 - `leancov report`     — merge `.cov` profiles, print CRAP/Cognitive-CRAP summary, export JSON & LCOV
-- `leancov analyze`    — static McCabe CC and Cognitive Complexity report without running tests -/
+- `leancov analyze`    — static McCabe CC and Cognitive Complexity report without running tests
+- `leancov mutate`     — AST-guided mutation testing in an isolated staged Lake workspace -/
 
 namespace LeanCov.CLI
 open Lean LeanCov.Cov
@@ -17,7 +19,7 @@ open Lean LeanCov.Cov
 def version : String := "0.1.0"
 
 private def usage : String :=
-"leancov — source-level Lean 4 coverage, McCabe CRAP, and Cognitive Complexity
+"leancov — source-level Lean 4 coverage, McCabe CRAP, Cognitive Complexity, and AST Mutation Testing
 
 Usage:
   leancov instrument --src <dir>[:<outDir>] [--src ...] [--out <dir>] --sites <sites.json>
@@ -33,6 +35,10 @@ Usage:
                      [--min-cov <pct>] [--max-crap <val>] [--max-cog-crap <val>]
   leancov analyze    --src <dir> [--src ...] [--exclude <substr>]... [--imports <Mod1,Mod2>]...
                      [--json <out.json>] [--top <N>] [--sort cog|cc]
+  leancov mutate     --pkg <pkgDir> [--out <workDir>] (--file <relFile> | --src-dir <relDir>)...
+                     [--filter <declSubstr>]... [--max-mutants <N>] [--timeout <sec>]
+                     [--build-target <lakeTarget>]... [--no-build] [--imports <Mod1,Mod2>]...
+                     [--json <out.json>] [--min-score <pct>] [--keep-work] -- <testCmd> [args...]
   leancov --version | -V
   leancov --help | -h
 "
@@ -99,7 +105,7 @@ private unsafe def cmdInstrument (args : List String) : IO UInt32 := do
   let mut extraImports : Array Name := #[]
   let mut boolOps : Bool := true
   let mut rest := args
-  while !rest.isEmpty do
+  repeat
     match rest with
     | "--src" :: v :: tl =>
       let (a, b) := splitColonPair v
@@ -189,6 +195,7 @@ private def rewriteLakefileLean (content : String) (pkgAbs leancovAbs : System.F
   if !isSelf && !alreadyHasLeancov then
     out := out.push ""
     out := out.push s!"require leancov from \"{leancovAbs}\""
+    out := out.push ""
   return "\n".intercalate out.toList
 
 /-- Rewrite relative `path = "..."` in `lakefile.toml` to absolute paths and optionally require `leancov`. -/
@@ -227,6 +234,7 @@ private def rewriteLakefileToml (content : String) (pkgAbs leancovAbs : System.F
     out := out.push "[[require]]"
     out := out.push "name = \"leancov\""
     out := out.push s!"path = \"{leancovAbs}\""
+    out := out.push ""
   return "\n".intercalate out.toList
 
 /-- Copy `lake-manifest.json` into the staged repo, absolutizing local path deps and adding `leancov`. -/
@@ -289,7 +297,7 @@ private partial def copyDirArmingMains (env : Environment) (srcDir dstDir : Syst
   let mut armedAny := false
   for entry in (← srcDir.readDir) do
     let name := entry.fileName
-    if name == ".git" || name == ".lake" || name == "build" then continue
+    if isIgnoredDirName name then continue
     let sp := entry.path
     let dp := dstDir / name
     if ← sp.isDir then
@@ -354,7 +362,7 @@ private def discoverStageSrcDirs (pkgAbs stageAbs : System.FilePath) (explicit :
   let mut dirs : Array String := #[]
   for entry in (← pkgAbs.readDir) do
     let name := entry.fileName
-    if name == ".git" || name == ".lake" || name == "build" || name.startsWith "." then continue
+    if isIgnoredDirName name || name.startsWith "." then continue
     let p := entry.path
     if isPrefixPath p stageAbs then continue
     if (← p.isDir) && (← dirContainsLean p) then
@@ -365,7 +373,7 @@ private def stageTopLevelEntry (env : Environment) (pkgAbs stageAbs leancovAbs :
     (isSelf : Bool) (depOverrides : Array (String × String)) (toInstrument : Array String)
     (entry : IO.FS.DirEntry) : IO Bool := do
   let name := entry.fileName
-  if name == ".git" || name == ".lake" || name == "build" then return false
+  if isIgnoredDirName name then return false
   let srcPath := entry.path
   if isPrefixPath srcPath stageAbs then return false
   let dstPath := stageAbs / name
@@ -455,19 +463,69 @@ private def stageTopLevelLeanFile (env : Environment) (stageAbs : System.FilePat
     let (outSrc, armed) ← armMainInSource env dispName src
     IO.FS.writeFile (stageAbs / name) outSrc
     return { acc with armedAny := acc.armedAny || armed }
-  let res ← instrumentSource env dispName src acc.nextId cfg
+  let res ← instrumentSource env dispName src acc.nextId { cfg with armMains := true }
   let skipped := match res.skippedReason with
     | some why => acc.skipped.push (dispName, why)
     | none => acc.skipped
-  let (outSrc, armed) ← armMainInSource env dispName res.instrumented
-  IO.FS.writeFile (stageAbs / name) outSrc
+  IO.FS.writeFile (stageAbs / name) res.instrumented
   return {
     nextId := res.nextSiteId
     sites := acc.sites ++ res.sites
     funcs := acc.funcs ++ res.functions
     skipped := skipped
-    armedAny := acc.armedAny || armed
+    armedAny := acc.armedAny || res.armedMain
   }
+
+private def readTrimmedIfExists (p : System.FilePath) : IO (Option String) := do
+  if !(← p.pathExists) then return none
+  let txt ← IO.FS.readFile p
+  let t := txt.trimAscii.copy
+  return if t.isEmpty then none else some t
+
+private def runtimeOnlyLakefile : String :=
+"import Lake
+open Lake DSL
+
+package «leancov» where
+  version := v!\"0.1.0\"
+
+target leancov_rt.o pkg : System.FilePath := do
+  let oFile := pkg.buildDir / \"c\" / \"leancov_rt.o\"
+  let srcJob ← inputTextFile <| pkg.dir / \"c\" / \"leancov_rt.c\"
+  let weakArgs := #[\"-I\", (← getLeanIncludeDir).toString]
+  buildO oFile srcJob weakArgs #[\"-fPIC\", \"-O2\", \"-Wall\", \"-Wextra\"] \"cc\" getLeanTrace
+
+extern_lib libleancov_rt pkg := do
+  let name := nameToStaticLib \"leancov_rt\"
+  let rtO ← leancov_rt.o.fetch
+  buildStaticLib (pkg.staticLibDir / name) #[rtO]
+
+lean_lib «LeanCov» where
+  roots := #[`LeanCov.Runtime, `LeanCov.DoSyntax, `LeanCov.Check, `LeanCov.Fuzz]
+  precompileModules := true
+"
+
+/-- When staging a package whose `lean-toolchain` differs from `leancov`'s own toolchain,
+materialize a private runtime-only `.leancov-pkg` inside `stageAbs` so `lake build` never
+clobbers `<leancovAbs>/.lake/build`. -/
+private def prepareStageLeancovDep (pkgAbs stageAbs leancovAbs : System.FilePath) (isSelf : Bool) :
+    IO System.FilePath := do
+  if isSelf then return leancovAbs
+  let some pkgTc ← readTrimmedIfExists (pkgAbs / "lean-toolchain") | return leancovAbs
+  let some lcTc ← readTrimmedIfExists (leancovAbs / "lean-toolchain") | return leancovAbs
+  if pkgTc == lcTc then return leancovAbs
+  let localLc := stageAbs / ".leancov-pkg"
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", localLc.toString] }
+  IO.FS.createDirAll (localLc / "c")
+  IO.FS.createDirAll (localLc / "LeanCov")
+  IO.FS.writeFile (localLc / "lean-toolchain") (pkgTc ++ "\n")
+  IO.FS.writeFile (localLc / "lakefile.lean") runtimeOnlyLakefile
+  IO.FS.writeFile (localLc / "c" / "leancov_rt.c") (← IO.FS.readFile (leancovAbs / "c" / "leancov_rt.c"))
+  for f in #["Runtime.lean", "DoSyntax.lean", "Check.lean", "Fuzz.lean"] do
+    let sp := leancovAbs / "LeanCov" / f
+    if ← sp.pathExists then
+      IO.FS.writeFile (localLc / "LeanCov" / f) (← IO.FS.readFile sp)
+  return localLc
 
 /-- Run `leancov stage`: create a clean out-of-tree instrumented copy of any Lake package. -/
 private unsafe def cmdStage (args : List String) : IO UInt32 := do
@@ -478,11 +536,12 @@ private unsafe def cmdStage (args : List String) : IO UInt32 := do
     IO.eprintln "stage: --out <stageDir> is required"
     return 2
   let pkgAbs ← canonicalOrAbs opts.pkgDir
-  let (leancovAbs, isSelf) ← match ← resolveLeancovDir pkgAbs opts with
+  let (rawLeancovAbs, isSelf) ← match ← resolveLeancovDir pkgAbs opts with
     | .ok r => pure r
     | .error e => IO.eprintln e; return 2
   IO.FS.createDirAll outDir
   let stageAbs ← canonicalOrAbs outDir
+  let leancovAbs ← prepareStageLeancovDep pkgAbs stageAbs rawLeancovAbs isSelf
   let depOverrides ← opts.depOverrides.mapM fun (k, p) => return (k, (← canonicalOrAbs ⟨p⟩).toString)
   let sitesOut := opts.sitesPath.getD (stageAbs / "sites.json")
   let cfg : InstrumentConfig := {
@@ -528,7 +587,7 @@ private def cmdRun (args : List String) : IO UInt32 := do
   let mut noDeferInit : Bool := false
   let mut cmdArgs : List String := []
   let mut rest := args
-  while !rest.isEmpty do
+  repeat
     match rest with
     | "--sites" :: v :: tl => sitesPath := some ⟨v⟩; rest := tl
     | "--profile" :: v :: tl => profilePath := some ⟨v⟩; rest := tl
@@ -560,6 +619,7 @@ private def cmdRun (args : List String) : IO UInt32 := do
   ]
   if m.armOnMain && !noDeferInit then
     envVars := envVars.push ("LEAN_COV_DEFER_INIT", some "1")
+  LeanCov.raiseStack ()
   let child ← IO.Process.spawn {
     cmd := cmd
     args := cargs.toArray
@@ -595,7 +655,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
   let mut maxCrap : Option Float := none
   let mut maxCogCrap : Option Float := none
   let mut rest := args
-  while !rest.isEmpty do
+  repeat
     match rest with
     | "--sites" :: v :: tl => sitesPath := some ⟨v⟩; rest := tl
     | "--profile" :: v :: tl => profiles := profiles.push ⟨v⟩; rest := tl
@@ -670,7 +730,7 @@ private unsafe def cmdAnalyze (args : List String) : IO UInt32 := do
   let mut topN : Nat := 30
   let mut sortByCog : Bool := true
   let mut rest := args
-  while !rest.isEmpty do
+  repeat
     match rest with
     | "--src" :: v :: tl => srcs := srcs.push ⟨v⟩; rest := tl
     | "--exclude" :: v :: tl => excludes := excludes.push v; rest := tl
@@ -712,6 +772,213 @@ private unsafe def cmdAnalyze (args : List String) : IO UInt32 := do
     IO.FS.writeFile jp (toJson manifest).pretty
   return 0
 
+private structure MutateOpts where
+  pkgDir : System.FilePath := "."
+  workDir : Option System.FilePath := none
+  files : Array String := #[]
+  srcDirs : Array String := #[]
+  filters : Array String := #[]
+  maxMutants : Option Nat := none
+  timeoutMs : Nat := 30000
+  buildTargets : Array String := #[]
+  noBuild : Bool := false
+  extraImports : Array Name := #[]
+  jsonOut : Option System.FilePath := none
+  minScore : Option Float := none
+  keepWork : Bool := false
+  cmdArgs : List String := []
+  deriving Inhabited
+
+private def splitCommaNonEmpty (s : String) : Array String :=
+  (s.splitOn ",").toArray.filterMap fun p =>
+    let t := p.trimAscii.copy
+    if t.isEmpty then none else some t
+
+private def parseMutateArgs : List String → MutateOpts → Except String MutateOpts
+  | [], o => pure o
+  | "--pkg" :: v :: tl, o => parseMutateArgs tl { o with pkgDir := ⟨v⟩ }
+  | "--out" :: v :: tl, o => parseMutateArgs tl { o with workDir := some ⟨v⟩ }
+  | "--file" :: v :: tl, o => parseMutateArgs tl { o with files := o.files.push v }
+  | "--src-dir" :: v :: tl, o => parseMutateArgs tl { o with srcDirs := o.srcDirs.push v }
+  | "--filter" :: v :: tl, o => parseMutateArgs tl { o with filters := o.filters ++ splitCommaNonEmpty v }
+  | "--max-mutants" :: v :: tl, o =>
+    match v.toNat? with
+    | some n => parseMutateArgs tl { o with maxMutants := some n }
+    | none => throw s!"invalid --max-mutants value: {v}"
+  | "--timeout" :: v :: tl, o =>
+    match parseFloat? v with
+    | some f =>
+      if f > 0.0 then parseMutateArgs tl { o with timeoutMs := max 1 (f * 1000.0).toUInt64.toNat }
+      else throw s!"--timeout must be > 0: {v}"
+    | none => throw s!"invalid --timeout value: {v}"
+  | "--build-target" :: v :: tl, o => parseMutateArgs tl { o with buildTargets := o.buildTargets.push v }
+  | "--no-build" :: tl, o => parseMutateArgs tl { o with noBuild := true }
+  | "--imports" :: v :: tl, o => parseMutateArgs tl { o with extraImports := o.extraImports ++ splitImports v }
+  | "--json" :: v :: tl, o => parseMutateArgs tl { o with jsonOut := some ⟨v⟩ }
+  | "--min-score" :: v :: tl, o =>
+    match parseFloat? v with
+    | some f => parseMutateArgs tl { o with minScore := some f }
+    | none => throw s!"invalid --min-score value: {v}"
+  | "--keep-work" :: tl, o => parseMutateArgs tl { o with keepWork := true }
+  | "--" :: tl, o => pure { o with cmdArgs := tl }
+  | tok :: tl, o =>
+    if tok.startsWith "-" then throw s!"unknown option for mutate: {tok}"
+    else pure { o with cmdArgs := tok :: tl }
+
+private def resolveInsidePkg (callerCwd pkgAbs : System.FilePath) (raw : String) :
+    IO (Option System.FilePath) := do
+  let p1 := pkgAbs / raw
+  if ← p1.pathExists then return some (← canonicalOrAbs p1)
+  let p2 := if (⟨raw⟩ : System.FilePath).isAbsolute then (⟨raw⟩ : System.FilePath) else callerCwd / raw
+  if ← p2.pathExists then
+    let abs ← canonicalOrAbs p2
+    if isPrefixPath pkgAbs abs then return some abs
+  return none
+
+private def collectMutateRelFiles (callerCwd pkgAbs : System.FilePath) (opts : MutateOpts) :
+    IO (Except String (Array String)) := do
+  if opts.files.isEmpty && opts.srcDirs.isEmpty then
+    return .error "mutate: at least one --file <relFile> or --src-dir <relDir> is required"
+  let mut rels : Array String := #[]
+  for f in opts.files do
+    let some abs ← resolveInsidePkg callerCwd pkgAbs f
+      | return .error s!"mutate: file not found inside package: {f}"
+    let r := relativeTo pkgAbs abs
+    if !rels.contains r then rels := rels.push r
+  for d in opts.srcDirs do
+    let some absDir ← resolveInsidePkg callerCwd pkgAbs d
+      | return .error s!"mutate: directory not found inside package: {d}"
+    for lf in (← collectLeanFiles absDir) do
+      let r := relativeTo pkgAbs lf
+      if !rels.contains r then rels := rels.push r
+  if rels.isEmpty then
+    return .error "mutate: no .lean files matched --file / --src-dir"
+  return .ok rels
+
+private partial def copyCleanDir (srcDir dstDir skipAbs : System.FilePath) : IO Unit := do
+  IO.FS.createDirAll dstDir
+  for entry in (← srcDir.readDir) do
+    let name := entry.fileName
+    if isIgnoredDirName name then continue
+    let sp := entry.path
+    if isPrefixPath sp skipAbs || isPrefixPath skipAbs sp then continue
+    let dp := dstDir / name
+    if ← sp.isDir then
+      copyCleanDir sp dp skipAbs
+    else
+      let _ ← IO.Process.output { cmd := "cp", args := #["-p", sp.toString, dp.toString] }
+
+private def warmLakeBuildCache (pkgAbs workAbs : System.FilePath) : IO Unit := do
+  for rel in #["ir", "lib/lean", "c"] do
+    let srcSub := pkgAbs / ".lake" / "build" / rel
+    if ← srcSub.isDir then
+      let dstSub := workAbs / ".lake" / "build" / rel
+      if let some p := dstSub.parent then IO.FS.createDirAll p
+      let _ ← IO.Process.output { cmd := "cp", args := #["-R", srcSub.toString, dstSub.toString] }
+
+private def stageMutateWorkspace (pkgAbs workAbs : System.FilePath) : IO Unit := do
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", workAbs.toString] }
+  IO.FS.createDirAll workAbs
+  for entry in (← pkgAbs.readDir) do
+    let name := entry.fileName
+    if isIgnoredDirName name then continue
+    let sp := entry.path
+    if isPrefixPath sp workAbs || isPrefixPath workAbs sp then continue
+    let dp := workAbs / name
+    if name == "lakefile.lean" then
+      let txt ← IO.FS.readFile sp
+      IO.FS.writeFile dp (rewriteLakefileLean txt pkgAbs pkgAbs (isSelf := true))
+    else if name == "lakefile.toml" then
+      let txt ← IO.FS.readFile sp
+      IO.FS.writeFile dp (rewriteLakefileToml txt pkgAbs pkgAbs (isSelf := true))
+    else if name == "lake-manifest.json" then
+      stageLakeManifest pkgAbs workAbs pkgAbs (isSelf := true)
+    else if ← sp.isDir then
+      copyCleanDir sp dp workAbs
+    else
+      let _ ← IO.Process.output { cmd := "cp", args := #["-p", sp.toString, dp.toString] }
+  stageLakePackages pkgAbs workAbs
+  warmLakeBuildCache pkgAbs workAbs
+
+private def resolveMutateTestCmd (callerCwd pkgAbs workAbs : System.FilePath) (rawCmd : String) :
+    IO (Except String String) := do
+  let checkNotUnmutated (abs : System.FilePath) : Except String String :=
+    if !isPrefixPath workAbs abs && isPrefixPath (pkgAbs / ".lake") abs then
+      .error s!"mutate: test command '{rawCmd}' points inside unmutated --pkg/.lake; use '.lake/build/bin/<exe>' so it runs from the staged workspace"
+    else .ok abs.toString
+  let fp : System.FilePath := ⟨rawCmd⟩
+  if fp.isAbsolute then
+    return checkNotUnmutated (← canonicalOrAbs fp)
+  if (rawCmd.splitOn "/").length > 1 then
+    if ← (workAbs / rawCmd).pathExists then
+      return .ok (← canonicalOrAbs (workAbs / rawCmd)).toString
+    if ← (callerCwd / rawCmd).pathExists then
+      return checkNotUnmutated (← canonicalOrAbs (callerCwd / rawCmd))
+  return .ok rawCmd
+
+private def removeWorkDirUnlessKept (workAbs : System.FilePath) (keep : Bool) : IO Unit := do
+  unless keep do
+    let _ ← IO.Process.output { cmd := "rm", args := #["-rf", workAbs.toString] }
+
+/-- Run `leancov mutate`: AST-guided mutation testing in an isolated staged Lake workspace. -/
+private unsafe def cmdMutate (args : List String) : IO UInt32 := do
+  let opts ← match parseMutateArgs args {} with
+    | .ok o => pure o
+    | .error e => IO.eprintln e; return 2
+  let rawCmd :: cmdRest := opts.cmdArgs | do
+    IO.eprintln "mutate: -- <testCmd> [args...] is required"
+    return 2
+  let callerCwd ← IO.currentDir
+  let pkgAbs ← canonicalOrAbs opts.pkgDir
+  let relFiles ← match ← collectMutateRelFiles callerCwd pkgAbs opts with
+    | .ok fs => pure fs
+    | .error e => IO.eprintln e; return 2
+  let env ← loadParserEnv opts.extraImports
+  let mut origByFile : Std.HashMap String String := {}
+  let mut allMutants : Array Mutant := #[]
+  for rel in relFiles do
+    let src ← IO.FS.readFile (pkgAbs / rel)
+    origByFile := origByFile.insert rel src
+    let ms ← discoverMutantsInSource env rel src allMutants.size opts.filters
+    allMutants := allMutants ++ ms
+  let discovered := allMutants.size
+  let selected := match opts.maxMutants with
+    | some n => (allMutants.take n).mapIdx fun i m => { m with id := i }
+    | none => allMutants
+  let defaultWork := pkgAbs / ".lake" / "build" / "leancov-mutate"
+  let rawWork := opts.workDir.getD defaultWork
+  IO.FS.createDirAll rawWork
+  let workAbs ← canonicalOrAbs rawWork
+  IO.println s!"Staging clean mutation workspace: {pkgAbs} -> {workAbs}"
+  IO.println s!"  Target files: {relFiles.size} | Mutants discovered: {discovered} | Running: {selected.size}"
+  stageMutateWorkspace pkgAbs workAbs
+  let cfg : MutateRunConfig := {
+    workDir := workAbs
+    buildTargets := opts.buildTargets
+    noBuild := opts.noBuild
+    testCmd := rawCmd
+    testArgs := cmdRest.toArray
+    timeoutMs := opts.timeoutMs
+  }
+  let res ← try
+    executeMutants cfg origByFile discovered selected (resolveMutateTestCmd callerCwd pkgAbs workAbs rawCmd)
+  catch e =>
+    removeWorkDirUnlessKept workAbs opts.keepWork
+    throw e
+  removeWorkDirUnlessKept workAbs opts.keepWork
+  let rep ← match res with
+    | .ok r => pure r
+    | .error e => IO.eprintln e; return 2
+  IO.println (formatMutateReport rep)
+  if let some jp := opts.jsonOut then
+    if let some p := jp.parent then IO.FS.createDirAll p
+    IO.FS.writeFile jp (toJson rep).pretty
+  if let some ms := opts.minScore then
+    if rep.score < ms then
+      IO.eprintln s!"FAIL: mutation score {rep.score}% < --min-score {ms}%"
+      return 1
+  return 0
+
 unsafe def runCLI (args : List String) : IO UInt32 := do
   match args with
   | "instrument" :: rest => cmdInstrument rest
@@ -719,6 +986,7 @@ unsafe def runCLI (args : List String) : IO UInt32 := do
   | "run" :: rest => cmdRun rest
   | "report" :: rest => cmdReport rest
   | "analyze" :: rest => cmdAnalyze rest
+  | "mutate" :: rest => cmdMutate rest
   | "--version" :: _ | "-V" :: _ =>
     IO.println s!"leancov {version}"
     return 0
