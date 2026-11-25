@@ -18,6 +18,9 @@ static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static uint64_t *g_hits = NULL;
 static size_t g_site_count = 0;
 static int g_armed = 1;
+static uint64_t *g_fuzz_base = NULL;
+static uint8_t *g_fuzz_seen = NULL;
+static size_t g_fuzz_cap = 0;
 
 static void leancov_expand_path(const char *tmpl, char *out, size_t out_sz) {
     size_t j = 0;
@@ -165,4 +168,85 @@ LEAN_EXPORT lean_object *leancov_raise_stack(lean_object *unit) {
         }
     }
     return lean_io_result_mk_ok(lean_box(0));
+}
+
+static uint8_t leancov_afl_bucket(uint64_t d) {
+    if (d == 1) return 1u;
+    if (d == 2) return 2u;
+    if (d == 3) return 4u;
+    if (d < 8) return 8u;
+    if (d < 16) return 16u;
+    if (d < 32) return 32u;
+    if (d < 128) return 64u;
+    return 128u;
+}
+
+LEAN_EXPORT lean_object *leancov_fuzz_reset(lean_object *unit) {
+    (void)unit;
+    pthread_once(&g_init_once, leancov_init_impl);
+    if (!g_hits) {
+        size_t cap = 65536u;
+        uint64_t *buf = (uint64_t *)calloc(cap, sizeof(uint64_t));
+        if (!buf) {
+            return lean_io_result_mk_ok(lean_box(0));
+        }
+        g_hits = buf;
+        g_site_count = cap;
+        __atomic_store_n(&g_armed, 1, __ATOMIC_RELEASE);
+    }
+    if (g_site_count > g_fuzz_cap) {
+        uint64_t *base = (uint64_t *)calloc(g_site_count, sizeof(uint64_t));
+        uint8_t *seen = (uint8_t *)calloc(g_site_count, sizeof(uint8_t));
+        if (!base || !seen) {
+            free(base);
+            free(seen);
+            return lean_io_result_mk_ok(lean_box(0));
+        }
+        free(g_fuzz_base);
+        free(g_fuzz_seen);
+        g_fuzz_base = base;
+        g_fuzz_seen = seen;
+        g_fuzz_cap = g_site_count;
+    }
+    for (size_t i = 0; i < g_fuzz_cap; i++) {
+        g_fuzz_base[i] = __atomic_load_n(&g_hits[i], __ATOMIC_RELAXED);
+    }
+    if (g_fuzz_seen && g_fuzz_cap > 0) {
+        memset(g_fuzz_seen, 0, g_fuzz_cap);
+    }
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+LEAN_EXPORT lean_object *leancov_fuzz_check_new(lean_object *unit) {
+    (void)unit;
+    size_t new_edges = 0;
+    if (g_hits && g_fuzz_base && g_fuzz_seen) {
+        size_t n = g_fuzz_cap < g_site_count ? g_fuzz_cap : g_site_count;
+        for (size_t i = 0; i < n; i++) {
+            uint64_t cur = __atomic_load_n(&g_hits[i], __ATOMIC_RELAXED);
+            uint64_t delta = cur - g_fuzz_base[i];
+            g_fuzz_base[i] = cur;
+            if (delta > 0) {
+                uint8_t bit = leancov_afl_bucket(delta);
+                if ((g_fuzz_seen[i] & bit) == 0) {
+                    g_fuzz_seen[i] |= bit;
+                    new_edges++;
+                }
+            }
+        }
+    }
+    return lean_io_result_mk_ok(lean_box_usize(new_edges));
+}
+
+LEAN_EXPORT lean_object *leancov_fuzz_covered_sites(lean_object *unit) {
+    (void)unit;
+    size_t count = 0;
+    if (g_fuzz_seen) {
+        for (size_t i = 0; i < g_fuzz_cap; i++) {
+            if (g_fuzz_seen[i] != 0) {
+                count++;
+            }
+        }
+    }
+    return lean_io_result_mk_ok(lean_box_usize(count));
 }

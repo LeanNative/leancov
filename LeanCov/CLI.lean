@@ -1,4 +1,5 @@
 import Lean.Data.Json
+import Std.Data.HashMap
 import LeanCov.Runtime
 import LeanCov.Cov
 
@@ -8,15 +9,17 @@ Subcommands:
 - `leancov instrument` — rewrite Lean source trees with source-level coverage probes and write `sites.json`
 - `leancov stage`      — stage an entire Lake package into an out-of-tree instrumented build directory
 - `leancov run`        — execute a command with `LEAN_COV_FILE` / `LEAN_COV_SITES` initialized
-- `leancov report`     — merge `.cov` profiles, print CRAP/Cognitive-CRAP summary, export JSON & LCOV
+- `leancov merge`      — combine multiple `.cov` profiles into one merged `.cov` file
+- `leancov report`     — merge `.cov` profiles, print CRAP/Cognitive-CRAP/patch/hot summary, export JSON/LCOV/Markdown
+- `leancov diff`       — compare two JSON coverage reports for CI regression gating
 - `leancov analyze`    — static McCabe CC and Cognitive Complexity report without running tests
-- `leancov mutate`     — AST-guided mutation testing in an isolated staged Lake workspace -/
+- `leancov mutate`     — AST-guided, coverage-pruned, proof-aware mutation testing in an isolated workspace -/
 
 namespace LeanCov.CLI
 open Lean LeanCov.Cov
 
 /-- Package version printed by `leancov --version` / `-V`. -/
-def version : String := "0.1.0"
+def version : String := "0.2.0"
 
 private def usage : String :=
 "leancov — source-level Lean 4 coverage, McCabe CRAP, Cognitive Complexity, and AST Mutation Testing
@@ -24,20 +27,28 @@ private def usage : String :=
 Usage:
   leancov instrument --src <dir>[:<outDir>] [--src ...] [--out <dir>] --sites <sites.json>
                      [--exclude <substr>]... [--imports <Mod1,Mod2>]... [--no-bool-ops]
-  leancov stage      --pkg <pkgDir> --out <stageDir> --leancov <leancovDir>
+  leancov stage      --pkg <pkgDir> --out <stageDir> [--leancov <leancovDir>]
                      [--src-dir <relDir>]... [--sites <sites.json>] [--append-sites]
                      [--prefix <relPrefix>] [--dep <name>=<path>]...
                      [--exclude <substr>]... [--imports <Mod1,Mod2>]... [--no-bool-ops] [--self]
   leancov run        --sites <sites.json> --profile <out.cov> [--append] [--no-defer-init] [--] <cmd> [args...]
+  leancov merge      --out <merged.cov> (--profile <p.cov> | --profile-dir <dir>)...
   leancov report     --sites <sites.json> (--profile <p.cov> | --profile-dir <dir>)...
-                     [--json <out.json>] [--lcov <out.info>] [--top <N>]
+                     [--json <out.json>] [--lcov <out.info>] [--markdown <out.md>] [--top <N>]
                      [--sort crap|cog|cc|uncov] [--files] [--kinds] [--missed]
+                     [--missed-detail] [--src-root <dir>] [--hot]
+                     [--git-diff <baseRef>] [--repo <dir>] [--min-patch-cov <pct>]
                      [--min-cov <pct>] [--max-crap <val>] [--max-cog-crap <val>]
+  leancov diff       --base <old.json> --head <new.json> [--top <N>]
+                     [--json <out.json>] [--markdown <out.md>]
+                     [--max-cov-drop <pct>] [--max-crap-delta <val>]
   leancov analyze    --src <dir> [--src ...] [--exclude <substr>]... [--imports <Mod1,Mod2>]...
                      [--json <out.json>] [--top <N>] [--sort cog|cc]
   leancov mutate     --pkg <pkgDir> [--out <workDir>] (--file <relFile> | --src-dir <relDir>)...
-                     [--filter <declSubstr>]... [--max-mutants <N>] [--timeout <sec>]
-                     [--build-target <lakeTarget>]... [--no-build] [--imports <Mod1,Mod2>]...
+                     [--filter <declSubstr>]... [--max-mutants <N>] [--seed <N>] [--timeout <sec>]
+                     [--build-target <lakeTarget>]... [--proof-target <lakeTarget>]... [--no-build]
+                     [--sites <sites.json> (--profile <p.cov> | --profile-dir <dir>)...]
+                     [--git-diff <baseRef>] [--no-arith] [--imports <Mod1,Mod2>]...
                      [--json <out.json>] [--min-score <pct>] [--keep-work] -- <testCmd> [args...]
   leancov --version | -V
   leancov --help | -h
@@ -354,6 +365,13 @@ private def resolveLeancovDir (pkgAbs : System.FilePath) (opts : StageOpts) :
     return .ok (abs, opts.isSelf || pkgAbs == abs)
   | none =>
     if opts.isSelf then return .ok (pkgAbs, true)
+    let mut dir? := (← IO.appPath).parent
+    for _ in [:8] do
+      let some d := dir? | break
+      if (← (d / "lakefile.lean").pathExists) && (← (d / "LeanCov" / "Runtime.lean").pathExists) then
+        let abs ← canonicalOrAbs d
+        return .ok (abs, pkgAbs == abs)
+      dir? := d.parent
     return .error "stage: --leancov <leancovDir> is required (or pass --self)"
 
 private def discoverStageSrcDirs (pkgAbs stageAbs : System.FilePath) (explicit : Array String) :
@@ -487,7 +505,7 @@ private def runtimeOnlyLakefile : String :=
 open Lake DSL
 
 package «leancov» where
-  version := v!\"0.1.0\"
+  version := v!\"0.2.0\"
 
 target leancov_rt.o pkg : System.FilePath := do
   let oFile := pkg.buildDir / \"c\" / \"leancov_rt.o\"
@@ -640,17 +658,62 @@ private def collectCovFiles (dir : System.FilePath) : IO (Array System.FilePath)
       out := out.push p
   return out.qsort fun a b => a.toString < b.toString
 
+private def collectGitChangedLines (repoDir : System.FilePath) (baseRef : String) :
+    IO (Except String (Std.HashMap String (Array Nat))) := do
+  let out ← IO.Process.output {
+    cmd := "git"
+    args := #["-C", repoDir.toString, "diff", "-U0", baseRef, "--", "*.lean"]
+  }
+  if out.exitCode != 0 then
+    return .error s!"git diff vs '{baseRef}' failed (exit {out.exitCode}): {out.stderr.trimAscii.copy}"
+  return .ok (parseGitUnifiedDiff out.stdout)
+
+/-- Run `leancov merge`: sum multiple `.cov` profiles into a single merged `.cov` file. -/
+private def cmdMerge (args : List String) : IO UInt32 := do
+  let mut outPath : Option System.FilePath := none
+  let mut profiles : Array System.FilePath := #[]
+  let mut rest := args
+  repeat
+    match rest with
+    | "--out" :: v :: tl => outPath := some ⟨v⟩; rest := tl
+    | "--profile" :: v :: tl => profiles := profiles.push ⟨v⟩; rest := tl
+    | "--profile-dir" :: v :: tl =>
+      profiles := profiles ++ (← collectCovFiles ⟨v⟩); rest := tl
+    | flag :: _ =>
+      IO.eprintln s!"unknown option for merge: {flag}"
+      return 2
+    | [] => break
+  let some outP := outPath | do IO.eprintln "merge: --out <merged.cov> is required"; return 2
+  if profiles.isEmpty then
+    IO.eprintln "merge: at least one --profile <file.cov> or --profile-dir <dir> is required"
+    return 2
+  let mut maxSites := 0
+  for p in profiles do
+    let hits ← readProfile p
+    if hits.size > maxSites then maxSites := hits.size
+  let merged ← mergeProfiles profiles maxSites
+  writeProfile outP merged
+  IO.println s!"Merged {profiles.size} profile(s) ({maxSites} sites) -> {outP}"
+  return 0
+
 /-- Run `leancov report`. -/
 private def cmdReport (args : List String) : IO UInt32 := do
   let mut sitesPath : Option System.FilePath := none
   let mut profiles : Array System.FilePath := #[]
   let mut jsonOut : Option System.FilePath := none
   let mut lcovOut : Option System.FilePath := none
+  let mut mdOut : Option System.FilePath := none
   let mut topN : Nat := 25
   let mut sortBy : SortKey := .crap
   let mut showFiles : Bool := false
   let mut showKinds : Bool := false
   let mut showMissed : Bool := false
+  let mut showMissedDetail : Bool := false
+  let mut showHot : Bool := false
+  let mut srcRoot : System.FilePath := "."
+  let mut gitDiffRef : Option String := none
+  let mut repoDir : System.FilePath := "."
+  let mut minPatchCov : Option Float := none
   let mut minCov : Option Float := none
   let mut maxCrap : Option Float := none
   let mut maxCogCrap : Option Float := none
@@ -663,6 +726,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
       profiles := profiles ++ (← collectCovFiles ⟨v⟩); rest := tl
     | "--json" :: v :: tl => jsonOut := some ⟨v⟩; rest := tl
     | "--lcov" :: v :: tl => lcovOut := some ⟨v⟩; rest := tl
+    | "--markdown" :: v :: tl => mdOut := some ⟨v⟩; rest := tl
     | "--top" :: v :: tl =>
       match v.toNat? with
       | some n => topN := n; rest := tl
@@ -674,6 +738,15 @@ private def cmdReport (args : List String) : IO UInt32 := do
     | "--files" :: tl => showFiles := true; rest := tl
     | "--kinds" :: tl => showKinds := true; rest := tl
     | "--missed" :: tl => showMissed := true; rest := tl
+    | "--missed-detail" :: tl => showMissedDetail := true; rest := tl
+    | "--src-root" :: v :: tl => srcRoot := ⟨v⟩; rest := tl
+    | "--hot" :: tl => showHot := true; rest := tl
+    | "--git-diff" :: v :: tl => gitDiffRef := some v; rest := tl
+    | "--repo" :: v :: tl => repoDir := ⟨v⟩; rest := tl
+    | "--min-patch-cov" :: v :: tl =>
+      match parseFloat? v with
+      | some f => minPatchCov := some f; rest := tl
+      | none => IO.eprintln s!"invalid --min-patch-cov value: {v}"; return 2
     | "--min-cov" :: v :: tl =>
       match parseFloat? v with
       | some f => minCov := some f; rest := tl
@@ -698,12 +771,33 @@ private def cmdReport (args : List String) : IO UInt32 := do
   let hits ← mergeProfiles profiles m.sites.size
   let rep := buildReport m hits
   IO.println (formatReport rep topN sortBy showFiles showMissed showKinds)
+  if showMissedDetail then
+    let topFuncs := (sortFuncReports rep.functions sortBy).take (if topN == 0 then rep.functions.size else topN)
+    let det ← formatMissedDetail m hits topFuncs srcRoot
+    if !det.isEmpty then
+      IO.println ("\n" ++ det)
+  if showHot then
+    IO.println ("\n" ++ formatHotSites m hits (if topN == 0 then 20 else topN))
+
+  let patchOpt? : Option PatchReport ← match gitDiffRef with
+    | none => pure none
+    | some ref =>
+      match ← collectGitChangedLines repoDir ref with
+      | .error e => IO.eprintln s!"report: {e}"; return 2
+      | .ok changed =>
+        let pr := buildPatchReport m hits ref changed
+        IO.println ("\n" ++ formatPatchReport pr)
+        pure (some pr)
+
   if let some jp := jsonOut then
     if let some p := jp.parent then IO.FS.createDirAll p
     IO.FS.writeFile jp (toJson rep).pretty
   if let some lp := lcovOut then
     if let some p := lp.parent then IO.FS.createDirAll p
     IO.FS.writeFile lp (toLcov m hits)
+  if let some mp := mdOut then
+    if let some p := mp.parent then IO.FS.createDirAll p
+    IO.FS.writeFile mp (formatReportMarkdown rep topN sortBy patchOpt?)
 
   let mut failed := false
   if let some mc := minCov then
@@ -718,6 +812,72 @@ private def cmdReport (args : List String) : IO UInt32 := do
   if let some xg := maxCogCrap then
     if rep.maxCogCrap > xg then
       IO.eprintln s!"FAIL: max Cognitive CRAP {rep.maxCogCrap} > --max-cog-crap {xg}"
+      failed := true
+  if let (some mpc, some pr) := (minPatchCov, patchOpt?) then
+    if pr.sitesTotal > 0 && pr.branchCov * 100.0 < mpc then
+      IO.eprintln s!"FAIL: patch branch coverage {pr.branchCov * 100.0}% < --min-patch-cov {mpc}%"
+      failed := true
+  return if failed then 1 else 0
+
+private def readSummaryJson (path : System.FilePath) : IO SummaryReport := do
+  let raw ← IO.FS.readFile path
+  match Json.parse raw >>= fromJson? with
+  | .ok r => return r
+  | .error e => throw (IO.userError s!"{path}: invalid report JSON: {e}")
+
+/-- Run `leancov diff`: compare two coverage JSON reports and gate regressions. -/
+private def cmdDiff (args : List String) : IO UInt32 := do
+  let mut basePath : Option System.FilePath := none
+  let mut headPath : Option System.FilePath := none
+  let mut jsonOut : Option System.FilePath := none
+  let mut mdOut : Option System.FilePath := none
+  let mut topN : Nat := 15
+  let mut maxCovDrop : Option Float := none
+  let mut maxCrapDelta : Option Float := none
+  let mut rest := args
+  repeat
+    match rest with
+    | "--base" :: v :: tl => basePath := some ⟨v⟩; rest := tl
+    | "--head" :: v :: tl => headPath := some ⟨v⟩; rest := tl
+    | "--json" :: v :: tl => jsonOut := some ⟨v⟩; rest := tl
+    | "--markdown" :: v :: tl => mdOut := some ⟨v⟩; rest := tl
+    | "--top" :: v :: tl =>
+      match v.toNat? with
+      | some n => topN := n; rest := tl
+      | none => IO.eprintln s!"invalid --top value: {v}"; return 2
+    | "--max-cov-drop" :: v :: tl =>
+      match parseFloat? v with
+      | some f => maxCovDrop := some f; rest := tl
+      | none => IO.eprintln s!"invalid --max-cov-drop value: {v}"; return 2
+    | "--max-crap-delta" :: v :: tl =>
+      match parseFloat? v with
+      | some f => maxCrapDelta := some f; rest := tl
+      | none => IO.eprintln s!"invalid --max-crap-delta value: {v}"; return 2
+    | flag :: _ =>
+      IO.eprintln s!"unknown option for diff: {flag}"
+      return 2
+    | [] => break
+  let some bp := basePath | do IO.eprintln "diff: --base <old.json> is required"; return 2
+  let some hp := headPath | do IO.eprintln "diff: --head <new.json> is required"; return 2
+  let baseRep ← readSummaryJson bp
+  let headRep ← readSummaryJson hp
+  let d := computeDiffReport baseRep headRep
+  IO.println (formatDiffReport d topN)
+  if let some jp := jsonOut then
+    if let some p := jp.parent then IO.FS.createDirAll p
+    IO.FS.writeFile jp (toJson d).pretty
+  if let some mp := mdOut then
+    if let some p := mp.parent then IO.FS.createDirAll p
+    IO.FS.writeFile mp (formatDiffMarkdown d topN)
+  let mut failed := false
+  if let some mcd := maxCovDrop then
+    let dropPct := -d.branchCovDelta * 100.0
+    if dropPct > mcd then
+      IO.eprintln s!"FAIL: branch coverage dropped by {dropPct}% > --max-cov-drop {mcd}%"
+      failed := true
+  if let some mxd := maxCrapDelta then
+    if d.maxCogCrapDelta > mxd || d.maxCrapDelta > mxd then
+      IO.eprintln s!"FAIL: max CRAP delta (cog={d.maxCogCrapDelta}, mccabe={d.maxCrapDelta}) > --max-crap-delta {mxd}"
       failed := true
   return if failed then 1 else 0
 
@@ -779,9 +939,15 @@ private structure MutateOpts where
   srcDirs : Array String := #[]
   filters : Array String := #[]
   maxMutants : Option Nat := none
+  seed : Option UInt64 := none
   timeoutMs : Nat := 30000
   buildTargets : Array String := #[]
+  proofTargets : Array String := #[]
   noBuild : Bool := false
+  includeArith : Bool := true
+  sitesPath : Option System.FilePath := none
+  profiles : Array System.FilePath := #[]
+  gitDiffRef : Option String := none
   extraImports : Array Name := #[]
   jsonOut : Option System.FilePath := none
   minScore : Option Float := none
@@ -789,13 +955,28 @@ private structure MutateOpts where
   cmdArgs : List String := []
   deriving Inhabited
 
+private def parseSeedUInt64? (s : String) : Option UInt64 :=
+  if s.startsWith "0x" then
+    let hexDigits := (s.drop 2).toString
+    if hexDigits.isEmpty then none
+    else
+      let val? := hexDigits.foldl (fun acc c => do
+        let d ←
+          if '0' ≤ c ∧ c ≤ '9' then some (c.toNat - '0'.toNat)
+          else if 'a' ≤ c ∧ c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
+          else if 'A' ≤ c ∧ c ≤ 'F' then some (c.toNat - 'A'.toNat + 10)
+          else none
+        some ((← acc) * 16 + d)) (some 0)
+      val?.map Nat.toUInt64
+  else s.toNat?.map Nat.toUInt64
+
 private def splitCommaNonEmpty (s : String) : Array String :=
   (s.splitOn ",").toArray.filterMap fun p =>
     let t := p.trimAscii.copy
     if t.isEmpty then none else some t
 
-private def parseMutateArgs : List String → MutateOpts → Except String MutateOpts
-  | [], o => pure o
+private def parseMutateArgs : List String → MutateOpts → IO (Except String MutateOpts)
+  | [], o => pure (.ok o)
   | "--pkg" :: v :: tl, o => parseMutateArgs tl { o with pkgDir := ⟨v⟩ }
   | "--out" :: v :: tl, o => parseMutateArgs tl { o with workDir := some ⟨v⟩ }
   | "--file" :: v :: tl, o => parseMutateArgs tl { o with files := o.files.push v }
@@ -804,26 +985,38 @@ private def parseMutateArgs : List String → MutateOpts → Except String Mutat
   | "--max-mutants" :: v :: tl, o =>
     match v.toNat? with
     | some n => parseMutateArgs tl { o with maxMutants := some n }
-    | none => throw s!"invalid --max-mutants value: {v}"
+    | none => pure (.error s!"invalid --max-mutants value: {v}")
+  | "--seed" :: v :: tl, o =>
+    match parseSeedUInt64? v with
+    | some s => parseMutateArgs tl { o with seed := some s }
+    | none => pure (.error s!"invalid --seed value: {v}")
   | "--timeout" :: v :: tl, o =>
     match parseFloat? v with
     | some f =>
       if f > 0.0 then parseMutateArgs tl { o with timeoutMs := max 1 (f * 1000.0).toUInt64.toNat }
-      else throw s!"--timeout must be > 0: {v}"
-    | none => throw s!"invalid --timeout value: {v}"
+      else pure (.error s!"--timeout must be > 0: {v}")
+    | none => pure (.error s!"invalid --timeout value: {v}")
   | "--build-target" :: v :: tl, o => parseMutateArgs tl { o with buildTargets := o.buildTargets.push v }
+  | "--proof-target" :: v :: tl, o => parseMutateArgs tl { o with proofTargets := o.proofTargets.push v }
   | "--no-build" :: tl, o => parseMutateArgs tl { o with noBuild := true }
+  | "--no-arith" :: tl, o => parseMutateArgs tl { o with includeArith := false }
+  | "--sites" :: v :: tl, o => parseMutateArgs tl { o with sitesPath := some ⟨v⟩ }
+  | "--profile" :: v :: tl, o => parseMutateArgs tl { o with profiles := o.profiles.push ⟨v⟩ }
+  | "--profile-dir" :: v :: tl, o => do
+    let covs ← collectCovFiles ⟨v⟩
+    parseMutateArgs tl { o with profiles := o.profiles ++ covs }
+  | "--git-diff" :: v :: tl, o => parseMutateArgs tl { o with gitDiffRef := some v }
   | "--imports" :: v :: tl, o => parseMutateArgs tl { o with extraImports := o.extraImports ++ splitImports v }
   | "--json" :: v :: tl, o => parseMutateArgs tl { o with jsonOut := some ⟨v⟩ }
   | "--min-score" :: v :: tl, o =>
     match parseFloat? v with
     | some f => parseMutateArgs tl { o with minScore := some f }
-    | none => throw s!"invalid --min-score value: {v}"
+    | none => pure (.error s!"invalid --min-score value: {v}")
   | "--keep-work" :: tl, o => parseMutateArgs tl { o with keepWork := true }
-  | "--" :: tl, o => pure { o with cmdArgs := tl }
+  | "--" :: tl, o => pure (.ok { o with cmdArgs := tl })
   | tok :: tl, o =>
-    if tok.startsWith "-" then throw s!"unknown option for mutate: {tok}"
-    else pure { o with cmdArgs := tok :: tl }
+    if tok.startsWith "-" then pure (.error s!"unknown option for mutate: {tok}")
+    else pure (.ok { o with cmdArgs := tok :: tl })
 
 private def resolveInsidePkg (callerCwd pkgAbs : System.FilePath) (raw : String) :
     IO (Option System.FilePath) := do
@@ -855,7 +1048,20 @@ private def collectMutateRelFiles (callerCwd pkgAbs : System.FilePath) (opts : M
     return .error "mutate: no .lean files matched --file / --src-dir"
   return .ok rels
 
+private partial def hasNestedIgnoredDir (dir : System.FilePath) : IO Bool := do
+  for name in #[".git", ".lake", "build"] do
+    if ← (dir / name).pathExists then return true
+  for entry in (← dir.readDir) do
+    let sp := entry.path
+    if ← sp.isDir then
+      if ← hasNestedIgnoredDir sp then return true
+  return false
+
 private partial def copyCleanDir (srcDir dstDir skipAbs : System.FilePath) : IO Unit := do
+  if !isPrefixPath srcDir skipAbs && !isPrefixPath skipAbs srcDir && !(← hasNestedIgnoredDir srcDir) then
+    if let some p := dstDir.parent then IO.FS.createDirAll p
+    let _ ← IO.Process.output { cmd := "cp", args := #["-Rp", srcDir.toString, dstDir.toString] }
+    return
   IO.FS.createDirAll dstDir
   for entry in (← srcDir.readDir) do
     let name := entry.fileName
@@ -922,11 +1128,17 @@ private def removeWorkDirUnlessKept (workAbs : System.FilePath) (keep : Bool) : 
 
 /-- Run `leancov mutate`: AST-guided mutation testing in an isolated staged Lake workspace. -/
 private unsafe def cmdMutate (args : List String) : IO UInt32 := do
-  let opts ← match parseMutateArgs args {} with
+  let opts ← match ← parseMutateArgs args {} with
     | .ok o => pure o
     | .error e => IO.eprintln e; return 2
   let rawCmd :: cmdRest := opts.cmdArgs | do
     IO.eprintln "mutate: -- <testCmd> [args...] is required"
+    return 2
+  if opts.sitesPath.isSome && opts.profiles.isEmpty then
+    IO.eprintln "mutate: --sites requires at least one --profile or --profile-dir"
+    return 2
+  if opts.sitesPath.isNone && !opts.profiles.isEmpty then
+    IO.eprintln "mutate: --profile / --profile-dir requires --sites <sites.json>"
     return 2
   let callerCwd ← IO.currentDir
   let pkgAbs ← canonicalOrAbs opts.pkgDir
@@ -939,29 +1151,41 @@ private unsafe def cmdMutate (args : List String) : IO UInt32 := do
   for rel in relFiles do
     let src ← IO.FS.readFile (pkgAbs / rel)
     origByFile := origByFile.insert rel src
-    let ms ← discoverMutantsInSource env rel src allMutants.size opts.filters
+    let ms ← discoverMutantsInSource env rel src allMutants.size opts.filters opts.includeArith
     allMutants := allMutants ++ ms
+  if let some ref := opts.gitDiffRef then
+    match ← collectGitChangedLines pkgAbs ref with
+    | .error e => IO.eprintln s!"mutate: {e}"; return 2
+    | .ok changed => allMutants := filterMutantsByGitDiff allMutants changed
   let discovered := allMutants.size
-  let selected := match opts.maxMutants with
-    | some n => (allMutants.take n).mapIdx fun i m => { m with id := i }
-    | none => allMutants
+  let sampled := match opts.maxMutants with
+    | some n => sampleMutants allMutants n opts.seed
+    | none => sampleMutants allMutants allMutants.size opts.seed
+  let (selected, preUncovered) ← match opts.sitesPath with
+    | none => pure (sampled, (#[] : Array MutantResult))
+    | some sp =>
+      let m ← readManifest sp
+      let hits ← mergeProfiles opts.profiles m.sites.size
+      pure (pruneUncoveredMutants sampled m hits)
   let defaultWork := pkgAbs / ".lake" / "build" / "leancov-mutate"
   let rawWork := opts.workDir.getD defaultWork
   IO.FS.createDirAll rawWork
   let workAbs ← canonicalOrAbs rawWork
   IO.println s!"Staging clean mutation workspace: {pkgAbs} -> {workAbs}"
-  IO.println s!"  Target files: {relFiles.size} | Mutants discovered: {discovered} | Running: {selected.size}"
+  let uncovMsg := if preUncovered.isEmpty then "" else s!" | Pruned uncovered: {preUncovered.size}"
+  IO.println s!"  Target files: {relFiles.size} | Mutants discovered: {discovered} | Running: {selected.size}{uncovMsg}"
   stageMutateWorkspace pkgAbs workAbs
   let cfg : MutateRunConfig := {
     workDir := workAbs
     buildTargets := opts.buildTargets
+    proofTargets := opts.proofTargets
     noBuild := opts.noBuild
     testCmd := rawCmd
     testArgs := cmdRest.toArray
     timeoutMs := opts.timeoutMs
   }
   let res ← try
-    executeMutants cfg origByFile discovered selected (resolveMutateTestCmd callerCwd pkgAbs workAbs rawCmd)
+    executeMutants cfg origByFile discovered selected (resolveMutateTestCmd callerCwd pkgAbs workAbs rawCmd) preUncovered
   catch e =>
     removeWorkDirUnlessKept workAbs opts.keepWork
     throw e
@@ -984,7 +1208,9 @@ unsafe def runCLI (args : List String) : IO UInt32 := do
   | "instrument" :: rest => cmdInstrument rest
   | "stage" :: rest => cmdStage rest
   | "run" :: rest => cmdRun rest
+  | "merge" :: rest => cmdMerge rest
   | "report" :: rest => cmdReport rest
+  | "diff" :: rest => cmdDiff rest
   | "analyze" :: rest => cmdAnalyze rest
   | "mutate" :: rest => cmdMutate rest
   | "--version" :: _ | "-V" :: _ =>

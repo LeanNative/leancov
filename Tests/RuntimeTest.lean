@@ -91,6 +91,28 @@ private def checkFuzzPrimitives : TM Unit := do
   check "mutate produces bounded output" (m1.size ≤ 64)
   let me ← LeanCov.Fuzz.mutate ByteArray.empty r1 32 #["tok".toUTF8]
   check "mutate empty bounded" (me.size ≤ 32)
+  LeanCov.fuzzReset ()
+  let v0 ← IO.monoMsNow
+  let pv := LeanCov.pass 500 v0
+  let e1 ← LeanCov.fuzzCheckNew ()
+  let e0 ← LeanCov.fuzzCheckNew ()
+  let mut acc : Nat := 0
+  for i in [:4] do
+    acc := acc + LeanCov.hit 501 fun () => i + 1
+  let e501a ← LeanCov.fuzzCheckNew ()
+  let mut acc2 : Nat := 0
+  for i in [:4] do
+    acc2 := acc2 + LeanCov.hit 501 fun () => i + 10
+  let e501b ← LeanCov.fuzzCheckNew ()
+  let covSites ← LeanCov.fuzzCoveredSites ()
+  checkEq "pass site 500 preserves value" pv v0
+  check "fuzzCheckNew sees first hit" (e1.toNat ≥ 1)
+  checkEq "fuzzCheckNew sees 0 on idle check" e0.toNat 0
+  checkEq "hit 501 loop sum" acc 10
+  checkEq "hit 501 loop2 sum" acc2 46
+  checkEq "fuzzCheckNew detects site 501 AFL bucket" e501a.toNat 1
+  checkEq "fuzzCheckNew ignores same AFL bucket" e501b.toNat 0
+  check "fuzzCoveredSites tracks >= 2 sites" (covSites.toNat ≥ 2)
 
 def main : IO UInt32 :=
   runMain "leancov-rt-test" do

@@ -1,4 +1,5 @@
 import Lean
+import Std.Data.HashMap
 import LeanCov.Cov.Types
 import LeanCov.Cov.Complexity
 
@@ -102,8 +103,41 @@ private structure FileState where
   edits : Array Edit := #[]
   decl : String := ""
   instrumentBoolOps : Bool := true
+  ignoredLines : Std.HashMap Nat Bool := {}
 
 private abbrev InstM := StateM FileState
+
+private def containsSubstr (haystack needle : String) : Bool :=
+  !needle.isEmpty && (haystack.splitOn needle).length > 1
+
+private def afterLineComment (line : String) : String :=
+  match line.splitOn "--" with
+  | [] | [_] => ""
+  | _ :: rest => "--".intercalate rest
+
+/-- Scan 1-based lines for `-- <marker>-start` ... `-- <marker>-end` ranges and single-line
+`-- <marker>` annotations. -/
+def computeIgnoredLines (src : String) (marker : String) : Std.HashMap Nat Bool := Id.run do
+  let startTag := marker ++ "-start"
+  let endTag := marker ++ "-end"
+  let mut out : Std.HashMap Nat Bool := {}
+  let mut inBlock := false
+  let mut lineNo := 1
+  for line in src.splitOn "\n" do
+    let comment := afterLineComment line
+    if containsSubstr comment endTag then
+      inBlock := false
+    if containsSubstr comment startTag then
+      inBlock := true
+    if inBlock || containsSubstr comment marker then
+      out := out.insert lineNo true
+    lineNo := lineNo + 1
+  return out
+
+private def isPosIgnored (pos : String.Pos.Raw) : InstM Bool := do
+  let s ← get
+  let line := (s.fileMap.toPosition pos).line
+  return s.ignoredLines.contains line
 
 private def allocSite (pos : String.Pos.Raw) (kind : BranchKind) (nesting : Nat) : InstM Nat := do
   let s ← get
@@ -168,6 +202,7 @@ private def isLineStart (bytePos : Nat) : InstM Bool := do
 
 private def emitDoProbe (seq : Syntax) (kind : BranchKind) (nesting : Nat) : InstM (Option Nat) := do
   if let some (a, b) := firstDoItemSpan? seq then
+    if ← isPosIgnored a then return none
     let id ← allocSite a kind nesting
     if ← isLineStart a.byteIdx then
       let col ← colOf a
@@ -194,6 +229,7 @@ private def isBoolOp (s : Syntax) : Bool :=
 
 private def emitCondWrap (operand : Syntax) (tKind fKind : BranchKind) (nesting : Nat) : InstM Unit := do
   if let (some a, some b) := (operand.getPos?, operand.getTailPos?) then
+    if ← isPosIgnored a then return
     let tId ← allocSite a tKind nesting
     let fId ← allocSite a fKind nesting
     if (← lineOf a) != (← lineOf b) then
@@ -217,6 +253,9 @@ private def addSemisBetweenDoItems (seq : Syntax) : InstM Unit := do
 without disturbing multi-line `doSeqIndent` layout. -/
 private def emitOneArmedDoIfBranch (anchorTok seq : Syntax) (nesting : Nat) : InstM Unit := do
   if let (some a, some b) := (seq.getPos?, seq.getTailPos?) then
+    if ← isPosIgnored a then return
+    if let some ap := anchorTok.getPos? then
+      if ← isPosIgnored ap then return
     let tId ← allocSite a .ifThen nesting
     let fId ← allocSite a .ifElse nesting
     if seq.getKind == `Lean.Parser.Term.doSeqBracketed then
@@ -261,6 +300,7 @@ private def emitOneArmedDoIfBranch (anchorTok seq : Syntax) (nesting : Nat) : In
 private def emitTermWrap (term : Syntax) (kind : BranchKind) (nesting : Nat) : InstM Unit := do
   if term.getKind == `Lean.Parser.Term.byTactic then return
   if let (some a, some b) := (term.getPos?, term.getTailPos?) then
+    if ← isPosIgnored a then return
     let id ← allocSite a kind nesting
     if (← lineOf a) != (← lineOf b) then
       let col ← colOf a
@@ -355,6 +395,10 @@ private partial def walkDoUnless (args : Array Syntax) (nesting : Nat) : InstM U
     (uTok.getPos?, uTok.getTailPos?, doTok.getPos?, doTok.getTailPos?, bodySeq.getPos?, bodySeq.getTailPos?)
     | for a in args do walkBody a nesting
       return
+  if (← isPosIgnored ua) || (← isPosIgnored ba) then
+    walkBody cond nesting
+    walkBody bodySeq (nesting + 1)
+    return
   let skipId ← allocSite ua .unlessSkip nesting
   let enterId ← allocSite ba .unlessEnter nesting
   addReplace ua.byteIdx (ub.byteIdx - ua.byteIdx) "if"
@@ -384,30 +428,34 @@ private partial def walkDoLoop (stx : Syntax) (args : Array Syntax) (nesting : N
     if i + 1 < args.size then
       walkBody a nesting
       continue
-    let trackSkip ← match stx.getPos?, stx.getTailPos? with
-      | some la, some _ => isLineStart la.byteIdx
-      | _, _ => pure false
-    match trackSkip, firstDoItemSpan? a, stx.getPos?, stx.getTailPos? with
-    | true, some (ba, bb), some la, some lb =>
-      let bodyId ← allocSite ba .loopBody nesting
-      let skipId ← allocSite la .loopSkip nesting
-      let lcol ← colOf la
-      let flag := s!"__lc_loop_{bodyId}"
-      addWrap la.byteIdx lb.byteIdx
-        s!"let mut {flag} := false;\n{spaces lcol}"
-        s!"\n{spaces lcol}if !{flag} then \{ leancov_hit% {skipId}; pure PUnit.unit };"
-      if ← isLineStart ba.byteIdx then
-        let bcol ← colOf ba
-        addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
-      else if a.getKind == `Lean.Parser.Term.doSeqBracketed then
-        addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId}; {flag} := true; "
-      else if (← lineOf ba) != (← lineOf bb) then
-        let bcol ← colOf ba
-        addWrap ba.byteIdx bb.byteIdx s!"\n{spaces bcol}leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
-      else
-        addWrap ba.byteIdx bb.byteIdx s!"\{ leancov_hit% {bodyId}; {flag} := true; " " }"
-    | _, _, _, _ =>
-      emitDoProbe_ a .loopBody nesting
+    let loopIgnored ← match stx.getPos? with
+      | some la => isPosIgnored la
+      | none => pure false
+    unless loopIgnored do
+      let trackSkip ← match stx.getPos?, stx.getTailPos? with
+        | some la, some _ => isLineStart la.byteIdx
+        | _, _ => pure false
+      match trackSkip, firstDoItemSpan? a, stx.getPos?, stx.getTailPos? with
+      | true, some (ba, bb), some la, some lb =>
+        let bodyId ← allocSite ba .loopBody nesting
+        let skipId ← allocSite la .loopSkip nesting
+        let lcol ← colOf la
+        let flag := s!"__lc_loop_{bodyId}"
+        addWrap la.byteIdx lb.byteIdx
+          s!"let mut {flag} := false;\n{spaces lcol}"
+          s!"\n{spaces lcol}if !{flag} then \{ leancov_hit% {skipId}; pure PUnit.unit };"
+        if ← isLineStart ba.byteIdx then
+          let bcol ← colOf ba
+          addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
+        else if a.getKind == `Lean.Parser.Term.doSeqBracketed then
+          addWrap ba.byteIdx bb.byteIdx s!"leancov_hit% {bodyId}; {flag} := true; "
+        else if (← lineOf ba) != (← lineOf bb) then
+          let bcol ← colOf ba
+          addWrap ba.byteIdx bb.byteIdx s!"\n{spaces bcol}leancov_hit% {bodyId};\n{spaces bcol}{flag} := true;\n{spaces bcol}"
+        else
+          addWrap ba.byteIdx bb.byteIdx s!"\{ leancov_hit% {bodyId}; {flag} := true; " " }"
+      | _, _, _, _ =>
+        emitDoProbe_ a .loopBody nesting
     walkBody a (nesting + 1)
 
 private partial def walkDoPatDecl (args : Array Syntax) (nesting : Nat) : InstM Unit := do
@@ -603,17 +651,14 @@ def extractDeclHead? (inner : Syntax) (src : String) (allowAbbrev : Bool := fals
 
 /-- Attach `.fnEntry` to a 0-branch callable body (`do`, `fun x => ...`, or binder-bearing RHS). -/
 private def emitCallableEntryProbe (body : Syntax) (hasBinders : Bool) : InstM Bool := do
+  let before := (← get).declSiteIds.size
   if body.getKind == `Lean.Parser.Term.do && body.getNumArgs ≥ 2 then
     emitDoProbe_ (body.getArg 1) .fnEntry 0
-    return true
   else if let some lamRhs := basicFunRhs? body then
     emitTermWrap lamRhs .fnEntry 0
-    return true
   else if hasBinders then
     emitTermWrap body .fnEntry 0
-    return true
-  else
-    return false
+  return (← get).declSiteIds.size > before
 
 private def instrumentWhereField (field : Syntax) (src : String) : InstM Unit := do
   unless field.getKind == `Lean.Parser.Term.structInstField && field.getNumArgs ≥ 2 do
@@ -896,9 +941,11 @@ def instrumentSource (env : Environment) (relFile src : String) (startSiteId : N
   if !cmds.isEmpty && cmds.all (·.2) then
     return { instrumented := src, sites := #[], functions := #[], nextSiteId := startSiteId,
              skippedReason := some ("parse error: " ++ "; ".intercalate errMsgs.toList) }
+  let ignored := if cfg.analyzeOnly then {} else computeIgnoredLines src "leancov:ignore"
   let initState : FileState := {
     file := relFile, src, fileMap := ic.fileMap, nextSiteId := startSiteId,
-    instrumentBoolOps := cfg.instrumentBoolOps
+    instrumentBoolOps := cfg.instrumentBoolOps,
+    ignoredLines := ignored
   }
   let run : InstM (Array FuncInfo) := do
     let mut scopeStack : List (Bool × List String) := []

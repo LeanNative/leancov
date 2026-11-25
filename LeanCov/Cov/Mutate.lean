@@ -16,6 +16,7 @@ open Lean Parser
 /-- Category of AST source mutation. -/
 inductive MutantKind where
   | cmpFlip
+  | arithFlip
   | boolOpFlip
   | boolLitFlip
   | negRemove
@@ -24,6 +25,7 @@ inductive MutantKind where
 
 def MutantKind.toString : MutantKind → String
   | .cmpFlip => "cmp.flip"
+  | .arithFlip => "arith.flip"
   | .boolOpFlip => "bool.op"
   | .boolLitFlip => "bool.lit"
   | .negRemove => "neg.remove"
@@ -31,6 +33,7 @@ def MutantKind.toString : MutantKind → String
 
 def MutantKind.ofString? : String → Option MutantKind
   | "cmp.flip" => some .cmpFlip
+  | "arith.flip" => some .arithFlip
   | "bool.op" => some .boolOpFlip
   | "bool.lit" => some .boolLitFlip
   | "neg.remove" => some .negRemove
@@ -45,25 +48,31 @@ instance : FromJson MutantKind where
     | some k => pure k
     | none => throw s!"unknown mutant kind: {s}"
 
-/-- Outcome of compiling and running the test suite against one mutant. -/
+/-- Outcome of compiling and running proofs/tests against one mutant. -/
 inductive MutantOutcome where
   | killed
+  | proved
   | survived
   | timeout
   | uncompilable
+  | uncovered
   deriving Repr, BEq, Inhabited
 
 def MutantOutcome.toString : MutantOutcome → String
   | .killed => "killed"
+  | .proved => "proved"
   | .survived => "survived"
   | .timeout => "timeout"
   | .uncompilable => "uncompilable"
+  | .uncovered => "uncovered"
 
 def MutantOutcome.ofString? : String → Option MutantOutcome
   | "killed" => some .killed
+  | "proved" => some .proved
   | "survived" => some .survived
   | "timeout" => some .timeout
   | "uncompilable" => some .uncompilable
+  | "uncovered" => some .uncovered
   | _ => none
 
 instance : ToJson MutantOutcome := ⟨fun o => Json.str o.toString⟩
@@ -101,8 +110,10 @@ structure MutateReport where
   discovered : Nat
   generated : Nat
   uncompilable : Nat
+  uncovered : Nat := 0
   tested : Nat
   killed : Nat
+  proved : Nat := 0
   timeout : Nat
   survived : Nat
   score : Float
@@ -127,6 +138,17 @@ private def cmpFlip? : String → Option String
   | ">=" => some ">"
   | _    => none
 
+private def arithFlip? : String → Option String
+  | "+"   => some "-"
+  | "-"   => some "+"
+  | "*"   => some "/"
+  | "/"   => some "*"
+  | "&&&" => some "|||"
+  | "|||" => some "&&&"
+  | "<<<" => some ">>>"
+  | ">>>" => some "<<<"
+  | _     => none
+
 private def boolOpFlip? : String → Option String
   | "&&" => some "||"
   | "||" => some "&&"
@@ -150,9 +172,17 @@ private structure MutState where
   fileMap : FileMap
   nextId : Nat
   decl : String := ""
+  includeArith : Bool := true
+  ignoredLines : Std.HashMap Nat Bool := {}
   mutants : Array Mutant := #[]
 
 private abbrev MutM := StateM MutState
+
+private def computeMutantIgnoredLines (src : String) : Std.HashMap Nat Bool := Id.run do
+  let mut out := computeIgnoredLines src "leancov:ignore"
+  for (ln, _) in (computeIgnoredLines src "leancov:ignore-mutant").toList do
+    out := out.insert ln true
+  return out
 
 private def sliceBytes (s : MutState) (a b : String.Pos.Raw) : String :=
   String.fromUTF8! (s.bytes.extract a.byteIdx (min b.byteIdx s.bytes.size))
@@ -161,6 +191,7 @@ private def recordMutant (pos tailPos : String.Pos.Raw) (kind : MutantKind)
     (origDisp repDisp repText : String) : MutM Unit := do
   let s ← get
   let p := s.fileMap.toPosition pos
+  if s.ignoredLines.contains p.line then return
   let m : Mutant := {
     id := s.nextId
     file := s.file
@@ -227,8 +258,16 @@ private def cmpKinds : Array SyntaxNodeKind := #[
   `«term_==_», `«term_!=_», `«term_<_», `«term_≤_», `«term_>_», `«term_≥_»
 ]
 
+private def arithKinds : Array SyntaxNodeKind := #[
+  `«term_+_», `«term_-_», `«term_*_», `«term_/_»,
+  `«term_&&&_», `«term_|||_», `«term_<<<_», `«term_>>>_»
+]
+
 private def isCmpKind (k : SyntaxNodeKind) : Bool :=
   cmpKinds.contains k
+
+private def isArithKind (k : SyntaxNodeKind) : Bool :=
+  arithKinds.contains k
 
 private def skippedMutNodeKinds : Array SyntaxNodeKind := #[
   `Lean.Parser.Term.dotIdent, `Lean.Parser.Term.structInstLVal
@@ -274,6 +313,11 @@ private partial def walkMutDoPatDecl (args : Array Syntax) : MutM Unit := do
 private partial def walkMutOp? (stx : Syntax) (k : SyntaxNodeKind) (args : Array Syntax) : MutM Bool := do
   if isCmpKind k && args.size ≥ 3 then
     emitInfixFlip args[1]! .cmpFlip cmpFlip?
+    walkMutExpr args[0]!; walkMutExpr args[2]!
+    return true
+  if isArithKind k && args.size ≥ 3 then
+    if (← get).includeArith then
+      emitInfixFlip args[1]! .arithFlip arithFlip?
     walkMutExpr args[0]!; walkMutExpr args[2]!
     return true
   if (k == `«term_&&_» || k == `«term_||_») && args.size ≥ 3 then
@@ -382,14 +426,16 @@ private partial def walkMutCommand (cmd : Syntax) (scopeStack : List (Bool × Li
 
 /-- Parse a `.lean` source file and return all AST-guided mutants in computational declarations. -/
 def discoverMutantsInSource (env : Environment) (relFile src : String) (startId : Nat := 0)
-    (filters : Array String := #[]) : IO (Array Mutant) := do
+    (filters : Array String := #[]) (includeArith : Bool := true) : IO (Array Mutant) := do
   let ic := mkInputContext src relFile
   let (_, pstate, msgs0) ← parseHeader ic
   if msgs0.hasErrors then return #[]
   let pmctx : ParserModuleContext := { env, options := {} }
   let (cmds, _) ← parseCommandsResilient ic pmctx pstate
   let init : MutState := {
-    file := relFile, src, bytes := src.toUTF8, fileMap := ic.fileMap, nextId := startId
+    file := relFile, src, bytes := src.toUTF8, fileMap := ic.fileMap, nextId := startId,
+    includeArith := includeArith,
+    ignoredLines := computeMutantIgnoredLines src
   }
   let run : MutM Unit := do
     let mut scopeStack : List (Bool × List String) := []
@@ -439,19 +485,87 @@ def runWithTimeout (cmd : String) (args : Array String) (cwd : System.FilePath)
 structure MutateRunConfig where
   workDir : System.FilePath
   buildTargets : Array String := #[]
+  proofTargets : Array String := #[]
   noBuild : Bool := false
   testCmd : String
   testArgs : Array String := #[]
   timeoutMs : Nat := 30000
 
-private def buildWorkspace (cfg : MutateRunConfig) : IO (UInt32 × String) := do
-  if cfg.noBuild then return (0, "")
+private def runLakeBuildTargets (workDir : System.FilePath) (targets : Array String) : IO (UInt32 × String) := do
   let out ← IO.Process.output {
     cmd := "lake"
-    args := #["build"] ++ cfg.buildTargets
-    cwd := some cfg.workDir
+    args := #["build"] ++ targets
+    cwd := some workDir
   }
   return (out.exitCode, out.stdout ++ out.stderr)
+
+private def buildWorkspace (cfg : MutateRunConfig) : IO (UInt32 × String) := do
+  if cfg.noBuild then return (0, "")
+  runLakeBuildTargets cfg.workDir cfg.buildTargets
+
+private def buildProofTargets (cfg : MutateRunConfig) : IO (UInt32 × String) := do
+  if cfg.proofTargets.isEmpty then return (0, "")
+  runLakeBuildTargets cfg.workDir cfg.proofTargets
+
+private def pathMatchesMutFile (mutFile otherFile : String) : Bool :=
+  mutFile == otherFile || otherFile.endsWith ("/" ++ mutFile) || mutFile.endsWith ("/" ++ otherFile)
+
+private def siteHitAt (hits : Array UInt64) (id : Nat) : UInt64 :=
+  if h : id < hits.size then hits[id] else 0
+
+/-- Filter mutants to those whose source line was modified/added in a parsed git diff. -/
+def filterMutantsByGitDiff (ms : Array Mutant) (changedLines : Std.HashMap String (Array Nat)) : Array Mutant :=
+  let entries := changedLines.toArray.map fun (f, lns) =>
+    let mp := lns.foldl (fun (acc : Std.HashMap Nat Bool) ln => acc.insert ln true) {}
+    (f, mp)
+  let kept := ms.filter fun m =>
+    entries.any fun (df, mp) => pathMatchesMutFile m.file df && mp.contains m.line
+  kept.mapIdx fun i m => { m with id := i }
+
+private def splitMixNext (st : UInt64) : UInt64 × UInt64 :=
+  let s := st + 0x9E3779B97F4A7C15
+  let a := (s ^^^ (s >>> 30)) * 0xBF58476D1CE4E5B9
+  let b := (a ^^^ (a >>> 27)) * 0x94D049BB133111EB
+  (s, b ^^^ (b >>> 31))
+
+/-- Select up to `maxN` mutants, optionally using a deterministic SplitMix64 shuffle when `seed?` is set. -/
+def sampleMutants (ms : Array Mutant) (maxN : Nat) (seed? : Option UInt64) : Array Mutant := Id.run do
+  let ordered := match seed? with
+    | none => ms
+    | some seed => Id.run do
+      let mut arr := ms
+      let mut st := seed
+      let n := arr.size
+      if n > 1 then
+        for i in [:n - 1] do
+          let (st', rnd) := splitMixNext st
+          st := st'
+          let j := i + (rnd.toNat % (n - i))
+          let tmp := arr[i]!
+          arr := arr.set! i arr[j]!
+          arr := arr.set! j tmp
+      arr
+  (ordered.take maxN).mapIdx fun i m => { m with id := i }
+
+/-- Prune mutants whose line (or enclosing function) had 0 runtime coverage hits, marking them `.uncovered`. -/
+def pruneUncoveredMutants (mutants : Array Mutant) (m : Manifest) (hits : Array UInt64) :
+    Array Mutant × Array MutantResult := Id.run do
+  let mut toTest : Array Mutant := #[]
+  let mut pruned : Array MutantResult := #[]
+  for mt in mutants do
+    let lineSites := m.sites.filter fun s => pathMatchesMutFile mt.file s.file && s.line == mt.line
+    let isUncov :=
+      if !lineSites.isEmpty then
+        lineSites.all fun s => siteHitAt hits s.id == 0
+      else
+        match m.functions.find? fun f => f.name == mt.decl && pathMatchesMutFile mt.file f.file with
+        | some fn => !fn.siteIds.isEmpty && fn.siteIds.all fun sid => siteHitAt hits sid == 0
+        | none => false
+    if isUncov then
+      pruned := pruned.push { mutant := mt, outcome := .uncovered, elapsedMs := 0 }
+    else
+      toTest := toTest.push mt
+  (toTest.mapIdx fun i mt => { mt with id := i }, pruned)
 
 private def evalOneMutant (cfg : MutateRunConfig) (origSrc : String) (m : Mutant) : IO MutantResult := do
   let targetPath := cfg.workDir / m.file
@@ -463,6 +577,11 @@ private def evalOneMutant (cfg : MutateRunConfig) (origSrc : String) (m : Mutant
       let elapsed := (← IO.monoMsNow) - t0
       IO.FS.writeFile targetPath origSrc
       return { mutant := m, outcome := .uncompilable, elapsedMs := elapsed }
+    let (pCode, _) ← buildProofTargets cfg
+    if pCode != 0 then
+      let elapsed := (← IO.monoMsNow) - t0
+      IO.FS.writeFile targetPath origSrc
+      return { mutant := m, outcome := .proved, elapsedMs := elapsed }
     let status ← runWithTimeout cfg.testCmd cfg.testArgs cfg.workDir cfg.timeoutMs
     IO.FS.writeFile targetPath origSrc
     match status with
@@ -477,31 +596,39 @@ private def evalOneMutant (cfg : MutateRunConfig) (origSrc : String) (m : Mutant
 /-- Build aggregate `MutateReport` from raw `MutantResult` records. -/
 def summarizeMutateResults (discovered : Nat) (results : Array MutantResult) : MutateReport := Id.run do
   let mut uncompilable := 0
+  let mut uncovered := 0
   let mut killed := 0
+  let mut proved := 0
   let mut timeout := 0
   let mut survived := 0
   for r in results do
     match r.outcome with
     | .uncompilable => uncompilable := uncompilable + 1
+    | .uncovered => uncovered := uncovered + 1
     | .killed => killed := killed + 1
+    | .proved => proved := proved + 1
     | .timeout => timeout := timeout + 1
     | .survived => survived := survived + 1
-  let tested := killed + timeout + survived
-  let score := if tested == 0 then 100.0 else 100.0 * Float.ofNat (killed + timeout) / Float.ofNat tested
+  let tested := proved + killed + timeout + survived
+  let score := if tested == 0 then 100.0 else 100.0 * Float.ofNat (proved + killed + timeout) / Float.ofNat tested
   return {
     discovered
     generated := results.size
-    uncompilable, tested, killed, timeout, survived
+    uncompilable, uncovered, tested, killed, proved, timeout, survived
     score, results
   }
 
-/-- Execute baseline verification (`lake build` + `testCmd`) and evaluate every mutant in `selected`. -/
+/-- Execute baseline verification (`lake build`, proof targets, and `testCmd`) and evaluate every mutant in `selected`. -/
 def executeMutants (cfg : MutateRunConfig) (origByFile : Std.HashMap String String)
     (discovered : Nat) (selected : Array Mutant)
-    (resolveCmd : IO (Except String String)) : IO (Except String MutateReport) := do
+    (resolveCmd : IO (Except String String))
+    (preResults : Array MutantResult := #[]) : IO (Except String MutateReport) := do
   let (baseBuildCode, baseBuildLog) ← buildWorkspace cfg
   if baseBuildCode != 0 then
     return .error s!"mutate: baseline `lake build` failed (exit {baseBuildCode}):\n{baseBuildLog}"
+  let (baseProofCode, baseProofLog) ← buildProofTargets cfg
+  if baseProofCode != 0 then
+    return .error s!"mutate: baseline proof `lake build` failed (exit {baseProofCode}):\n{baseProofLog}"
   let resolvedCmd ← match ← resolveCmd with
     | .ok c => pure c
     | .error e => return .error e
@@ -512,16 +639,18 @@ def executeMutants (cfg : MutateRunConfig) (origByFile : Std.HashMap String Stri
   | .exited code _ =>
     if code != 0 then
       return .error s!"mutate: baseline test command failed with exit code {code} before any mutation"
-  let mut results : Array MutantResult := Array.mkEmpty selected.size
+  let mut results : Array MutantResult := preResults
   for i in [:selected.size] do
     let m := selected[i]!
     let origSrc := origByFile.getD m.file ""
     let res ← evalOneMutant runCfg origSrc m
     let tag := match res.outcome with
       | .killed => "KILLED      "
+      | .proved => "PROVED      "
       | .survived => "SURVIVED    "
       | .timeout => "TIMEOUT     "
       | .uncompilable => "UNCOMPILABLE"
+      | .uncovered => "UNCOVERED   "
     IO.println s!"  [{i + 1}/{selected.size}] {tag} {m.file}:{m.line} ({m.decl}) `{m.original}` -> `{m.replacement}` ({res.elapsedMs}ms)"
     results := results.push res
   return .ok (summarizeMutateResults discovered results)
@@ -536,9 +665,11 @@ def formatMutateReport (r : MutateReport) : String := Id.run do
   out := out.push "=== LeanCov AST Mutation Report ==="
   let capNote := if r.discovered > r.generated then s!" (sampled from {r.discovered} discovered)" else ""
   out := out.push s!"Generated:    {r.generated}{capNote}"
-  out := out.push s!"Uncompilable: {r.uncompilable} (excluded from denominator)"
-  out := out.push s!"Tested:       {r.tested} | Killed: {r.killed} | Timeout: {r.timeout} | Survived: {r.survived}"
-  out := out.push s!"Score:        {round1Mut r.score}% ({r.killed + r.timeout}/{r.tested})"
+  let uncovNote := if r.uncovered > 0 then s!" | Uncovered: {r.uncovered}" else ""
+  out := out.push s!"Uncompilable: {r.uncompilable}{uncovNote} (excluded from denominator)"
+  let provedNote := if r.proved > 0 then s!"Proved: {r.proved} | " else ""
+  out := out.push s!"Tested:       {r.tested} | {provedNote}Killed: {r.killed} | Timeout: {r.timeout} | Survived: {r.survived}"
+  out := out.push s!"Score:        {round1Mut r.score}% ({r.proved + r.killed + r.timeout}/{r.tested})"
   let survivors := r.results.filter (·.outcome == .survived)
   if !survivors.isEmpty then
     out := out.push ""

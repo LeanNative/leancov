@@ -41,4 +41,17 @@ dependent proofs `h : p` and `h : ¬p`. -/
   | isTrue h => hit tSite fun () => isTrue h
   | isFalse h => hit fSite fun () => isFalse h
 
+/-- Snapshot current runtime coverage counters and clear per-site AFL edge buckets for a fuzz campaign. -/
+@[extern "leancov_fuzz_reset", noinline]
+public def fuzzReset (_ : Unit) : IO Unit := pure ()
+
+/-- Compare live counters against the previous snapshot, update AFL edge buckets, and return
+how many new `(site, log2_bucket)` edges were triggered since the last check. -/
+@[extern "leancov_fuzz_check_new", noinline]
+public def fuzzCheckNew (_ : Unit) : IO USize := pure 0
+
+/-- Count how many coverage probe sites have been hit at least once since the last `fuzzReset`. -/
+@[extern "leancov_fuzz_covered_sites", noinline]
+public def fuzzCoveredSites (_ : Unit) : IO USize := pure 0
+
 end LeanCov

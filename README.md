@@ -24,11 +24,11 @@ Unlike C-level (`clang -fprofile-instr-generate`) coverage over Lean's generated
 | Module | Purpose | `Lean` runtime dep? |
 |---|---|---|
 | `LeanCov.Check` | Minimal test harness (`check`, `checkEq`, `fail`, `need`, `needE`, `refused`, `runTest`, `runMain`, `<EXE>_ONLY`) | None |
-| `LeanCov.Fuzz` | Deterministic SplitMix64 mutation fuzzer with `LEAN_ABORT_ON_PANIC=1` supervision, stall watchdog, and corpus replay | None |
-| `LeanCov.Runtime` | `@[extern]` probe primitives backed by `c/leancov_rt.c` (`libleancov_rt`) | None |
+| `LeanCov.Fuzz` | Deterministic SplitMix64 coverage-guided fuzzer with delta-debugging minimization, `LEAN_ABORT_ON_PANIC=1` supervision, stall watchdog, and corpus replay | None |
+| `LeanCov.Runtime` | `@[extern]` probe primitives & fuzz feedback backed by `c/leancov_rt.c` (`libleancov_rt`) | None |
 | `LeanCov.DoSyntax` | Eager `leancov_hit%` (`doElem`) and `leancov_term%` (`term`) elaborators | Meta-only (`public meta import Lean.Elab.Do`) |
-| `LeanCov.Cov` | AST complexity analyzer, byte-offset instrumenter, AST mutator, binary `.cov` I/O, JSON & LCOV reporter | Compiler/CLI only |
-| `leancov` CLI | Standalone CLI (`stage`, `instrument`, `run`, `report`, `analyze`, `mutate`, `--version`) | CLI binary |
+| `LeanCov.Cov` | AST complexity analyzer, byte-offset instrumenter, AST mutator, binary `.cov` I/O, diff/patch/hot JSON, Markdown & LCOV reporter | Compiler/CLI only |
+| `leancov` CLI | Standalone CLI (`stage`, `instrument`, `run`, `merge`, `report`, `diff`, `analyze`, `mutate`, `--version`) | CLI binary |
 
 ## Installation
 
@@ -87,7 +87,7 @@ ln -sf "$(pwd)/.lake/build/bin/leancov" ~/.local/bin/leancov
 export PATH="$(pwd)/.lake/build/bin:$PATH"
 
 # Verify installation
-leancov --version   # prints: leancov 0.1.0
+leancov --version   # prints: leancov 0.2.0
 ```
 
 > **Note on toolchain lookup:** `leancov` walks up from its resolved executable path to find its own `lean-toolchain` and Lean sysroot, so symlinking `.lake/build/bin/leancov` works from any working directory. If you copy the binary out of the checkout, set `LEAN_SYSROOT="$(lean --print-prefix)"`.
@@ -121,7 +121,11 @@ leancov stage \
   --exclude Proofs/ --exclude Tests/
 ```
 
-If `leancov` is already a Lake dependency of your project, point `--leancov` at `.lake/packages/leancov`. Use `--src-dir <relDir>` (repeatable) to select specific source directories instead of auto-discovering all directories containing `.lean` files.
+If `leancov` is already a Lake dependency of your project, point `--leancov` at `.lake/packages/leancov`. When omitted (and not `--self`), `leancov stage` auto-detects its own repository root from the running binary. Use `--src-dir <relDir>` (repeatable) to select specific source directories instead of auto-discovering all directories containing `.lean` files.
+
+Inline pragma exclusions in Lean comments suppress instrumentation or mutation on specific lines or blocks:
+- `-- leancov:ignore` / `-- leancov:ignore-start` ... `-- leancov:ignore-end` — skip coverage probes and mutations
+- `-- leancov:ignore-mutant` / `-- leancov:ignore-mutant-start` ... `-- leancov:ignore-mutant-end` — skip mutations only
 
 Build your test executables inside the staged copy:
 
@@ -142,26 +146,45 @@ leancov run \
 
 Pass `--append` to accumulate multiple runs into the same `.cov` file, or save separate `.cov` files into a directory and merge them with `--profile-dir` at report time. Use `--no-defer-init` to include module-initializer hits.
 
-### 4. Report Coverage, CRAP, JSON & LCOV (`report`)
+### 4. Merge, Report, Patch Coverage, & Diff (`merge`, `report`, `diff`)
 
-Merge one or more `.cov` profiles, print summary tables, and export machine-readable JSON and LCOV:
+Combine `.cov` shards into one `.cov` file with `leancov merge`:
+
+```sh
+leancov merge --out build/merged.cov --profile-dir build/leancov-stage/profiles
+```
+
+Merge one or more `.cov` profiles, print summary tables, missed site snippets (`--missed-detail`), execution hotspots (`--hot`), or git diff patch coverage (`--git-diff`), and export JSON, LCOV, or GitHub-flavored Markdown (`--markdown`):
 
 ```sh
 leancov report \
   --sites build/leancov-stage/sites.json \
   --profile-dir build/leancov-stage/profiles \
-  --sort cog --files --kinds --missed --top 25 \
+  --sort cog --files --kinds --missed-detail --hot --top 25 \
+  --git-diff origin/main --min-patch-cov 80.0 \
   --json build/leancov-stage/coverage.json \
-  --lcov build/leancov-stage/lcov.info
+  --lcov build/leancov-stage/lcov.info \
+  --markdown build/leancov-stage/report.md
+```
+
+Compare two saved JSON reports for CI regression gating with `leancov diff`:
+
+```sh
+leancov diff \
+  --base base-coverage.json \
+  --head build/leancov-stage/coverage.json \
+  --markdown build/leancov-stage/diff.md \
+  --max-cov-drop 1.0 --max-crap-delta 5.0
 ```
 
 Sort modes: `--sort crap` (McCabe CRAP, default), `--sort cog` (Cognitive CRAP), `--sort cc` (McCabe CC), or `--sort uncov` (uncovered branch count). Generate browsable HTML from LCOV with `genhtml build/leancov-stage/lcov.info -o build/html`.
 
-### 5. AST-Guided Mutation Testing (`mutate`)
+### 5. AST-Guided, Coverage-Pruned & Proof-Aware Mutation Testing (`mutate`)
 
 `leancov mutate` parses computational declarations (`def`, `abbrev`, `instance`) with Lean's parser—skipping `theorem`s, `by` tactic proofs, type signatures, `termination_by` clauses, `have` obligations, attributes, and pattern binders—and evaluates semantics-changing mutants inside a clean out-of-tree staged copy:
 
 - **Comparison & equality flips:** `==` <-> `!=`, `<` <-> `≤`, `<=` -> `<`, `>` <-> `≥`, `>=` -> `>`
+- **Arithmetic & bitwise flips:** `+` <-> `-`, `*` <-> `/`, `&&&` <-> `|||`, `<<<` <-> `>>>` (disable with `--no-arith`)
 - **Boolean operator flips:** `&&` <-> `||`
 - **Boolean literal flips:** `true` <-> `false` (`Bool.true` <-> `Bool.false`)
 - **Negation mutations:** `!x` -> `x` / `(x)` and `if c then` / `unless c do` -> `!(c)`
@@ -171,7 +194,9 @@ leancov mutate \
   --pkg . \
   --file MyLib/Policy.lean \
   --filter authorize \
-  --build-target my-tests \
+  --sites build/leancov-stage/sites.json --profile-dir build/leancov-stage/profiles \
+  --git-diff origin/main --seed 0x77 \
+  --build-target my-tests --proof-target MyProofs \
   --timeout 30 \
   --min-score 80.0 \
   --json build/mutate.json \
@@ -180,11 +205,12 @@ leancov mutate \
 
 Key flags & execution model:
 
-- `(--file <relFile> | --src-dir <relDir>)...` — select individual files or directories to mutate.
-- `--filter <declSubstr>` (repeatable or comma-separated) — restrict mutations to matching declaration names; `--max-mutants <N>` caps sample size.
-- `--build-target <lakeTarget>` (repeatable) — target(s) built per mutant inside the staged workspace (`--out <workDir>`, default `<pkgDir>/.lake/build/leancov-mutate`). Existing `.lake/packages/*` symlinks and `.lake/build/{ir,lib/lean,c}` caches are reused so incremental mutant builds stay fast.
-- **Outcome classification:** mutants rejected by Lean's typechecker (e.g., broken dependent bounds proofs like `if h : i < xs.size then xs[i]`) are classified as **`uncompilable` and excluded from the score denominator**; compiled mutants are run with a wall-clock `--timeout <sec>` (default `30`s), yielding `killed` (non-zero exit), `timeout` (killed on hang), or `survived` (zero exit).
-- **Mutation score:** `100 * (killed + timeout) / tested`, failing with exit code `1` if below `--min-score <pct>`. Pass `--keep-work` to retain `<workDir>` after completion.
+- `(--file <relFile> | --src-dir <relDir>)...` — select individual files or directories to mutate; combine with `--git-diff <baseRef>` to mutate only changed/added lines.
+- `--filter <declSubstr>` (repeatable or comma-separated) — restrict mutations to matching declaration names; `--max-mutants <N>` with optional `--seed <N>` samples deterministically.
+- `--sites` + `--profile` / `--profile-dir` — skips mutants on 0-hit uncovered lines/functions immediately (`uncovered`, excluded from denominator).
+- `--build-target <lakeTarget>` (repeatable) — target(s) built per mutant inside the staged workspace (`--out <workDir>`, default `<pkgDir>/.lake/build/leancov-mutate`); `--proof-target <lakeTarget>` catches mutants rejected by formal theorem targets (`proved`).
+- **Outcome classification:** mutants rejected by Lean's typechecker in build targets are classified as **`uncompilable`** and mutants on 0-hit lines as **`uncovered`** (both excluded from denominator); mutants caught by `--proof-target` are **`proved`**, and compiled mutants are run with a wall-clock `--timeout <sec>` (default `30`s), yielding **`killed`**, **`timeout`**, or **`survived`**.
+- **Mutation score:** `100 * (proved + killed + timeout) / tested`, failing with exit code `1` if below `--min-score <pct>`. Pass `--keep-work` to retain `<workDir>` after completion.
 
 ### Multi-Package Workspaces
 
@@ -267,6 +293,8 @@ def myTarget : LeanCov.Fuzz.Target := {
 def main (args : List String) : IO UInt32 :=
   LeanCov.Fuzz.main #[myTarget] args (corpus := some "Corpus")
 ```
+
+Coverage-guided fuzzing uses in-process AFL edge-bucket feedback by default (`--no-guided` disables) and delta-debugging crash minimization (`--no-minimize` disables).
 
 ## Instrumented Constructs
 

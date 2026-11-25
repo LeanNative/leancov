@@ -132,6 +132,16 @@ def initProfile (path : System.FilePath) (siteCount : Nat) : IO Unit := do
     buf := buf.push 0
   IO.FS.writeBinFile path buf
 
+/-- Write a hit counter array to a binary `.cov` profile file. -/
+def writeProfile (path : System.FilePath) (hits : Array UInt64) : IO Unit := do
+  if let some p := path.parent then IO.FS.createDirAll p
+  let mut buf := ByteArray.emptyWithCapacity (profileHeaderBytes + hits.size * 8)
+  buf := buf ++ profileMagic
+  buf := pushU64LE buf hits.size.toUInt64
+  for h in hits do
+    buf := pushU64LE buf h
+  IO.FS.writeBinFile path buf
+
 /-- Read a `.cov` counter file into an array of hit counts. -/
 def readProfile (path : System.FilePath) : IO (Array UInt64) := do
   let data ← IO.FS.readBinFile path

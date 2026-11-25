@@ -79,6 +79,9 @@ private def testTypesAndProfiles : TM Unit := do
   initProfile pZero 0
   checkEq "0-site profile read" (← readProfile pZero) #[]
   checkEq "empty mergeProfiles" (← mergeProfiles #[] 0) #[]
+  let wp := dir / "written.cov"
+  writeProfile wp #[7, 0, 42]
+  checkEq "writeProfile round-trip" (← readProfile wp) #[7, 0, 42]
 
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
 
@@ -616,6 +619,54 @@ end Outer.Inner
   let srStandalone ← resolveSysroot (some ⟨"/tmp"⟩) (some "")
   check "resolveSysroot standalone fallback non-empty" (!srStandalone.toString.isEmpty)
 
+  -- `-- leancov:ignore` single-line, block start/end, and non-comment string safety
+  let ignSrc := "
+def ignDemo (x : Nat) (b : Bool) : IO Nat := do
+  let s := \"-- leancov:ignore\"
+  if s.length > 0 then
+    pure ()
+  if x > 99 then -- leancov:ignore
+    pure () -- leancov:ignore
+  else
+    pure ()
+  -- leancov:ignore-start
+  unless b do
+    for _ in [1, 2] do
+      pure ()
+  -- leancov:ignore-end
+  if b && !b then
+    return 1
+  return 0
+
+-- leancov:ignore-start
+def ignAllFunc (n : Nat) : Nat := n + 1
+-- leancov:ignore-end
+
+def oneArmedIgnore (b : Bool) (n : Nat) : IO Unit := do
+  if b then -- leancov:ignore
+    IO.println n -- leancov:ignore
+  if b then
+    IO.println n -- leancov:ignore
+  if b then {
+    IO.println n
+  }
+  if b then do
+    IO.println n
+    IO.println (n + 1)
+  else if n > 0 then
+    IO.println n
+"
+  let ignRes ← instrumentSource env "IgnoreDemo.lean" ignSrc 0 {}
+  checkEq "ignDemo parses cleanly after ignores" ignRes.skippedReason none
+  check "ignAllFunc skipped when body ignored" (!ignRes.functions.any (·.name == "ignAllFunc"))
+  let _ ← need "ignDemo present"
+    (match ignRes.functions.find? (·.name == "ignDemo") with
+     | some f => Except.ok f | none => Except.error "missing")
+  check "ignDemo skipped unless/for inside ignore block"
+    (!ignRes.sites.any (fun s => s.decl == "ignDemo" && (s.kind == .unlessEnter || s.kind == .loopBody)))
+  check "ignDemo kept non-ignored bool ops"
+    (ignRes.sites.any (fun s => s.decl == "ignDemo" && s.kind == .andTrue))
+
 private def testReportAndLcov : TM Unit := do
   -- Mix real branches AND straight-line `fn.entry` to verify strict branch vs function separation
   let manifest : Manifest := {
@@ -730,6 +781,119 @@ private def testReportAndLcov : TM Unit := do
   check "tie lcov includes OnlyFn.lean" ((tieLcov.splitOn "SF:OnlyFn.lean").length > 1)
   check "tie lcov includes SitesOnly.lean (FNF:0)" ((tieLcov.splitOn "SF:SitesOnly.lean").length > 1)
 
+  -- Rich diagnostics: parseGitUnifiedDiff, buildPatchReport, formatMissedDetail, formatHotSites,
+  -- formatReportMarkdown, and computeDiffReport / formatDiffReport / formatDiffMarkdown
+  let diffSample := "diff --git a/src/Foo.lean b/src/Foo.lean
+--- a/src/Foo.lean
++++ b/src/Foo.lean
+@@ -9,0 +10,2 @@
++  if x then ...
++  else ...
+@@ -15,1 +16,0 @@
+-removed line
+@@ -20 +25 @@
++single line
+@@ bad @@
+diff --git a/Plain.lean b/Plain.lean
++++ Plain.lean
+@@ -1 +3,1 @@
++plain
+diff --git a/src/Dead.lean b/src/Dead.lean
++++ /dev/null
+"
+  let parsedDiff := parseGitUnifiedDiff diffSample
+  checkEq "parsedDiff Foo.lean lines" (parsedDiff.getD "src/Foo.lean" #[]) #[10, 11, 25]
+  checkEq "parsedDiff Plain.lean lines" (parsedDiff.getD "Plain.lean" #[]) #[3]
+  check "empty git diff" (parseGitUnifiedDiff "").isEmpty
+  let patchRep := buildPatchReport manifest hits "origin/main" parsedDiff
+  checkEq "patchRep sitesTotal" patchRep.sitesTotal 2
+  checkEq "patchRep sitesHit" patchRep.sitesHit 2
+  check "formatPatchReport mentions baseRef" (((formatPatchReport patchRep).splitOn "origin/main").length > 1)
+  let missedPatchRep := buildPatchReport manifest #[0, 0, 0, 0, 0] "HEAD~1" parsedDiff
+  check "formatPatchReport lists missed patch branch" (((formatPatchReport missedPatchRep).splitOn "missed patch branch").length > 1)
+  let zeroPatch := buildPatchReport {} #[] "HEAD" ∅
+  check "formatPatchReport 0 changed sites" (((formatPatchReport zeroPatch).splitOn "0 changed branch sites").length > 1)
+
+  let hotTxt := formatHotSites manifest hits 3
+  check "formatHotSites lists Foo.linear count 10 first" ((hotTxt.splitOn "Foo.linear").length > 1)
+  check "formatHotSites 0 hits" (((formatHotSites manifest #[] 5).splitOn "no hits").length > 1)
+  let mdTxt := formatReportMarkdown rep 5 .cog (some missedPatchRep)
+  check "formatReportMarkdown has header & patch" ((mdTxt.splitOn "## LeanCov Report").length > 1 && (mdTxt.splitOn "Missed Patch Branches").length > 1)
+  let mdZeroPatch := formatReportMarkdown rep 0 .cog (some zeroPatch)
+  check "formatReportMarkdown 0-site patch" ((mdZeroPatch.splitOn "| Patch branches").length > 1)
+
+  let srcTmp : System.FilePath := ".lake/build/tmp_detail_src"
+  IO.FS.createDirAll srcTmp
+  let mut demoLines := Array.replicate 25 "  -- filler"
+  demoLines := demoLines.set! 19 "  match k with"
+  demoLines := demoLines.set! 20 ("  | .other => " ++ String.ofList (List.replicate 110 'x'))
+  demoLines := demoLines.set! 21 ""
+  IO.FS.writeFile (srcTmp / "Foo.lean") ("\n".intercalate demoLines.toList ++ "\n")
+  let detailEmpty ← formatMissedDetail manifest hits #[] srcTmp
+  checkEq "formatMissedDetail empty fns" detailEmpty ""
+  let detailAllHit ← formatMissedDetail manifest #[1, 1, 1, 1, 1] rep.functions srcTmp
+  checkEq "formatMissedDetail all covered" detailAllHit ""
+  let multiSiteManifest : Manifest := {
+    sites := #[
+      { id := 0, file := "Foo.lean", decl := "Foo.baz", line := 22, col := 1, kind := .ifThen },
+      { id := 1, file := "Foo.lean", decl := "Foo.baz", line := 21, col := 8, kind := .ifElse },
+      { id := 2, file := "Foo.lean", decl := "Foo.baz", line := 21, col := 3, kind := .matchArm },
+      { id := 3, file := "Foo.lean", decl := "Foo.baz", line := 999, col := 1, kind := .ifThen }
+    ]
+    functions := #[rep.functions[1]!.name |> fun n => { name := n, file := "Foo.lean", line := 19, endLine := 22, lines := 4, cc := 10, cognitive := 2, siteIds := #[0, 1, 2, 3] }]
+  }
+  let detailOk ← formatMissedDetail multiSiteManifest #[0, 0, 0, 0] #[rep.functions[0]!, rep.functions[1]!] srcTmp
+  check "formatMissedDetail truncates >96 chars & sorts sites" ((detailOk.splitOn "...").length > 1 && (detailOk.splitOn "Foo.lean:21:3").length > 1)
+  let detailMissing ← formatMissedDetail manifest hits rep.functions (srcTmp / "nonexistent")
+  check "formatMissedDetail tolerates missing srcRoot" ((detailMissing.splitOn "Foo.lean:21:3").length > 1)
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", srcTmp.toString] }
+
+  -- Diff report: empty, unchanged, regressed (via crapDelta & cogCrapDelta), improved, addedUncovered & addedCovered
+  let emptyDiff := computeDiffReport emptyRep emptyRep
+  checkEq "empty diff regressed" emptyDiff.regressed.size 0
+  let baseRep : SummaryReport := {
+    sitesTotal := 10, sitesHit := 8, branchCov := 0.8
+    linesTotal := 10, linesHit := 8, lineCov := 0.8
+    functionsTotal := 4, functionsHit := 3
+    maxCrap := 12.0, maxCogCrap := 10.0, avgCrap := 7.0, avgCogCrap := 6.0
+    crapOver30 := 0, cogCrapOver30 := 0, files := #[]
+    functions := #[
+      { name := "Reg", file := "A.lean", line := 1, endLine := 10, lines := 10, cc := 6, cognitive := 5, sitesTotal := 4, sitesHit := 4, branchCov := 1.0, crap := 6.0, cogCrap := 5.0 },
+      { name := "RegCrapOnly", file := "A.lean", line := 3, endLine := 6, lines := 4, cc := 4, cognitive := 1, sitesTotal := 2, sitesHit := 2, branchCov := 1.0, crap := 4.0, cogCrap := 1.0 },
+      { name := "Imp", file := "A.lean", line := 12, endLine := 20, lines := 9, cc := 5, cognitive := 5, sitesTotal := 4, sitesHit := 0, branchCov := 0.0, crap := 30.0, cogCrap := 30.0 },
+      { name := "ImpCrapOnly", file := "A.lean", line := 22, endLine := 25, lines := 4, cc := 4, cognitive := 1, sitesTotal := 2, sitesHit := 0, branchCov := 0.0, crap := 20.0, cogCrap := 1.0 },
+      { name := "Same", file := "A.lean", line := 26, endLine := 28, lines := 3, cc := 2, cognitive := 1, sitesTotal := 1, sitesHit := 1, branchCov := 1.0, crap := 2.0, cogCrap := 1.0 }
+    ]
+  }
+  let headRep : SummaryReport := {
+    sitesTotal := 12, sitesHit := 8, branchCov := 0.667
+    linesTotal := 12, linesHit := 8, lineCov := 0.667
+    functionsTotal := 6, functionsHit := 4
+    maxCrap := 42.0, maxCogCrap := 30.0, avgCrap := 18.0, avgCogCrap := 13.0
+    crapOver30 := 1, cogCrapOver30 := 0, files := #[]
+    functions := #[
+      { name := "Reg", file := "A.lean", line := 1, endLine := 10, lines := 10, cc := 6, cognitive := 5, sitesTotal := 4, sitesHit := 0, branchCov := 0.0, crap := 42.0, cogCrap := 30.0 },
+      { name := "RegCrapOnly", file := "A.lean", line := 3, endLine := 6, lines := 4, cc := 4, cognitive := 1, sitesTotal := 2, sitesHit := 1, branchCov := 0.5, crap := 6.0, cogCrap := 1.0 },
+      { name := "Imp", file := "A.lean", line := 12, endLine := 20, lines := 9, cc := 5, cognitive := 5, sitesTotal := 4, sitesHit := 4, branchCov := 1.0, crap := 5.0, cogCrap := 5.0 },
+      { name := "ImpCrapOnly", file := "A.lean", line := 22, endLine := 25, lines := 4, cc := 4, cognitive := 1, sitesTotal := 2, sitesHit := 2, branchCov := 1.0, crap := 4.0, cogCrap := 1.0 },
+      { name := "Same", file := "A.lean", line := 26, endLine := 28, lines := 3, cc := 2, cognitive := 1, sitesTotal := 1, sitesHit := 1, branchCov := 1.0, crap := 2.0, cogCrap := 1.0 },
+      { name := "NewUncov", file := "B.lean", line := 5, endLine := 12, lines := 8, cc := 4, cognitive := 4, sitesTotal := 2, sitesHit := 0, branchCov := 0.0, crap := 20.0, cogCrap := 20.0 },
+      { name := "NewUncov2", file := "B.lean", line := 15, endLine := 18, lines := 4, cc := 3, cognitive := 2, sitesTotal := 2, sitesHit := 0, branchCov := 0.0, crap := 12.0, cogCrap := 6.0 },
+      { name := "NewCov", file := "B.lean", line := 20, endLine := 21, lines := 2, cc := 1, cognitive := 0, sitesTotal := 1, sitesHit := 1, branchCov := 1.0, crap := 1.0, cogCrap := 0.0 }
+    ]
+  }
+  let dr := computeDiffReport baseRep headRep
+  checkEq "diff regressed count" dr.regressed.size 2
+  checkEq "diff improved count" dr.improved.size 2
+  checkEq "diff addedUncovered count" dr.addedUncovered.size 2
+  check "formatDiffReport shows sections"
+    (((formatDiffReport dr 10).splitOn "Regressed functions").length > 1 &&
+     ((formatDiffReport dr 10).splitOn "Added uncovered").length > 1 &&
+     ((formatDiffReport dr 10).splitOn "Improved functions").length > 1)
+  check "formatDiffReport topN=0 omits lists" (((formatDiffReport dr 0).splitOn "Regressed functions").length == 1)
+  check "formatDiffMarkdown renders tables" (((formatDiffMarkdown dr 10).splitOn "| Branches |").length > 1)
+  check "formatDiffMarkdown topN=0 omits lists" (((formatDiffMarkdown dr 0).splitOn "### Regressed").length == 1)
+
 private unsafe def testCLISubcommands : TM Unit := do
   let dir : System.FilePath := ".lake/build/tmp_cli_test"
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
@@ -795,7 +959,9 @@ private unsafe def testCLISubcommands : TM Unit := do
   checkEq "cli stage empty --dep val" (← LeanCov.CLI.runCLI ["stage", "--dep", "k=", "--out", (dir / "err1").toString, "--self"]) 2
   checkEq "cli stage empty --dep key" (← LeanCov.CLI.runCLI ["stage", "--dep", "=v", "--out", (dir / "err1").toString, "--self"]) 2
   checkEq "cli stage missing --out" (← LeanCov.CLI.runCLI ["stage", "--pkg", pkgToml.toString, "--self"]) 2
-  checkEq "cli stage missing --leancov" (← LeanCov.CLI.runCLI ["stage", "--pkg", pkgToml.toString, "--out", (dir / "err2").toString]) 2
+  -- Omitting `--leancov` auto-detects the enclosing `leancov` checkout from `IO.appPath`
+  checkEq "cli stage auto-detects --leancov" (← LeanCov.CLI.runCLI ["stage", "--pkg", pkgToml.toString, "--out", (dir / "auto_lc").toString, "--src-dir", "Lib"]) 0
+  check "cli stage auto-detect wrote lakefile.toml" (← (dir / "auto_lc" / "lakefile.toml").pathExists)
 
   -- `stage` on lakefile.toml + lake-manifest.json + --dep + --prefix, then --append-sites on lakefile.lean!
   let stage1 := dir / "stage1"
@@ -966,6 +1132,79 @@ private unsafe def testCLISubcommands : TM Unit := do
   checkEq "cli report unknown opt" (← LeanCov.CLI.runCLI ["report", "--bogus"]) 2
   checkEq "cli report missing sites" (← LeanCov.CLI.runCLI ["report", "--profile", prof.toString]) 2
   checkEq "cli report missing profile" (← LeanCov.CLI.runCLI ["report", "--sites", combinedSites.toString]) 2
+  checkEq "cli report bad min-patch-cov" (← LeanCov.CLI.runCLI ["report", "--sites", combinedSites.toString, "--profile", prof.toString, "--min-patch-cov", "nope"]) 2
+
+  -- `merge`, rich `report` flags (--missed-detail, --hot, --markdown, --git-diff), and `diff`
+  let mergedCov := dir / "merged.cov"
+  checkEq "cli merge ok" (← LeanCov.CLI.runCLI ["merge", "--out", mergedCov.toString, "--profile", prof.toString, "--profile-dir", (dir / "pid_prof").toString]) 0
+  check "cli merge wrote file" (← mergedCov.pathExists)
+  checkEq "cli merge missing out" (← LeanCov.CLI.runCLI ["merge", "--profile", prof.toString]) 2
+  checkEq "cli merge missing profile" (← LeanCov.CLI.runCLI ["merge", "--out", mergedCov.toString]) 2
+  checkEq "cli merge unknown opt" (← LeanCov.CLI.runCLI ["merge", "--bogus"]) 2
+
+  -- Real temporary git repo to exercise `report --git-diff` + `--min-patch-cov` + `--missed-detail` + `--hot` + `--markdown`
+  let gitPkg := dir / "git_patch_repo"
+  IO.FS.createDirAll (gitPkg / "Mod")
+  IO.FS.writeFile (gitPkg / "Mod" / "Logic.lean") "def f (x : Nat) : Nat := x\n"
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", gitPkg.toString, "init"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", gitPkg.toString, "config", "user.email", "ci@example.com"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", gitPkg.toString, "config", "user.name", "CI"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", gitPkg.toString, "add", "."] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", gitPkg.toString, "commit", "-m", "init"] }
+  IO.FS.writeFile (gitPkg / "Mod" / "Logic.lean") "def f (x : Nat) : Nat :=\n  if x > 0 then x else 0\n"
+  let gitSites := dir / "git_sites.json"
+  let gitInstOut := dir / "git_inst_out"
+  checkEq "instrument git repo" (← LeanCov.CLI.runCLI ["instrument", "--src", (gitPkg / "Mod").toString, "--out", gitInstOut.toString, "--sites", gitSites.toString]) 0
+  let gitManifest ← needE "parse git sites" id (Json.parse (← IO.FS.readFile gitSites) >>= fromJson? : Except String Manifest)
+  let gitProf := dir / "git_run.cov"
+  let mut gitHits := Array.replicate gitManifest.sites.size (0 : UInt64)
+  if gitHits.size > 0 then gitHits := gitHits.set! 0 5
+  writeProfile gitProf gitHits
+  let repMd := dir / "rep.md"
+  let repPatchJson := dir / "rep_patch.json"
+  checkEq "cli report --git-diff + --markdown + --hot + --missed-detail (min-patch-cov 40 pass)" (← LeanCov.CLI.runCLI [
+    "report", "--sites", gitSites.toString, "--profile", gitProf.toString,
+    "--missed-detail", "--src-root", (gitPkg / "Mod").toString, "--hot",
+    "--markdown", repMd.toString, "--json", repPatchJson.toString,
+    "--git-diff", "HEAD", "--repo", gitPkg.toString, "--min-patch-cov", "40.0"
+  ]) 0
+  check "report wrote markdown" (← repMd.pathExists)
+  checkEq "cli report --min-patch-cov 80 fails" (← LeanCov.CLI.runCLI [
+    "report", "--sites", gitSites.toString, "--profile", gitProf.toString,
+    "--git-diff", "HEAD", "--repo", gitPkg.toString, "--min-patch-cov", "80.0", "--top", "0"
+  ]) 1
+  checkEq "cli report bad --git-diff ref exits 2" (← LeanCov.CLI.runCLI [
+    "report", "--sites", gitSites.toString, "--profile", gitProf.toString,
+    "--git-diff", "nonexistent_ref_xyz", "--repo", gitPkg.toString
+  ]) 2
+
+  -- `diff` CLI subcommand (pass, fail on cov-drop, fail on crap-delta, validation errors)
+  let baseCov := dir / "git_base.cov"
+  writeProfile baseCov (Array.replicate gitManifest.sites.size (2 : UInt64))
+  let baseRepJson := dir / "base_rep.json"
+  checkEq "generate base_rep.json" (← LeanCov.CLI.runCLI [
+    "report", "--sites", gitSites.toString, "--profile", baseCov.toString, "--json", baseRepJson.toString, "--top", "0"
+  ]) 0
+  let diffJson := dir / "diff.json"
+  let diffMd := dir / "diff.md"
+  checkEq "cli diff ok" (← LeanCov.CLI.runCLI [
+    "diff", "--base", repPatchJson.toString, "--head", baseRepJson.toString,
+    "--json", diffJson.toString, "--markdown", diffMd.toString,
+    "--max-cov-drop", "5.0", "--max-crap-delta", "5.0", "--top", "10"
+  ]) 0
+  check "cli diff wrote json & md" ((← diffJson.pathExists) && (← diffMd.pathExists))
+  checkEq "cli diff fails on --max-cov-drop" (← LeanCov.CLI.runCLI [
+    "diff", "--base", baseRepJson.toString, "--head", repPatchJson.toString, "--max-cov-drop", "5.0"
+  ]) 1
+  checkEq "cli diff fails on --max-crap-delta" (← LeanCov.CLI.runCLI [
+    "diff", "--base", baseRepJson.toString, "--head", repPatchJson.toString, "--max-crap-delta", "0.1"
+  ]) 1
+  checkEq "cli diff missing base" (← LeanCov.CLI.runCLI ["diff", "--head", baseRepJson.toString]) 2
+  checkEq "cli diff missing head" (← LeanCov.CLI.runCLI ["diff", "--base", baseRepJson.toString]) 2
+  checkEq "cli diff bad --top" (← LeanCov.CLI.runCLI ["diff", "--base", baseRepJson.toString, "--head", baseRepJson.toString, "--top", "abc"]) 2
+  checkEq "cli diff bad --max-cov-drop" (← LeanCov.CLI.runCLI ["diff", "--base", baseRepJson.toString, "--head", baseRepJson.toString, "--max-cov-drop", "abc"]) 2
+  checkEq "cli diff bad --max-crap-delta" (← LeanCov.CLI.runCLI ["diff", "--base", baseRepJson.toString, "--head", baseRepJson.toString, "--max-crap-delta", "abc"]) 2
+  checkEq "cli diff unknown opt" (← LeanCov.CLI.runCLI ["diff", "--bogus"]) 2
 
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
 
@@ -980,9 +1219,19 @@ private def testFuzzPrimitives : TM Unit := do
     let base := if i % 5 == 0 then ByteArray.empty else "hello world 12345".toUTF8
     let m ← LeanCov.Fuzz.mutate base r1 32 (if i % 2 == 0 then toks else #[])
     check "mutate respects max" (m.size ≤ 32)
-  -- `require` pass & fail
+  -- `require` pass & fail + `minimizeInput` shrinker
   LeanCov.Fuzz.require true "ok"
   check "Fuzz.require throws on false" (← catchesIO (LeanCov.Fuzz.require false "boom"))
+  let shrinkTarget : LeanCov.Fuzz.Target := {
+    name := "shrink"
+    seeds := #[⟨#[0x7A]⟩]
+    check := fun _ bs => do
+      for i in [:bs.size] do
+        if bs[i]! == 0x7A then throw (IO.userError "hit 0x7A")
+      return true
+  }
+  let shrunk ← LeanCov.Fuzz.minimizeInput shrinkTarget ⟨#[1, 2, 0x7A, 4, 5]⟩
+  check "minimizeInput shrinks to 1 byte" (shrunk == ⟨#[0x7A]⟩)
 
   -- End-to-end `Fuzz.main` supervisor + child + corpus replay + finding + bad option
   let fuzzBin := ((← IO.appPath).parent.getD ".lake/build/bin") / "leancov-fuzz-test"
@@ -1005,13 +1254,30 @@ private def testFuzzPrimitives : TM Unit := do
       env := #[("LEANCOV_TEST_CORPUS", some (fdir / "corpus").toString)]
     }
     check "fuzz clean + corpus passes" (okClean.exitCode == 0) s!"{okClean.stdout}{okClean.stderr}"
-    -- 2. Finding caught & saved (with decimal seed)
+    -- 2. Finding caught, minimized, & saved (with decimal seed), plus `--no-minimize`
     let findOut ← IO.Process.output {
       cmd := fuzzBin.toString
       args := #["--target", "finding", "--iterations", "50", "--seed", "66", "--save", (fdir / "saved").toString]
     }
     checkEq "fuzz finding exits 1" findOut.exitCode 1
     check "fuzz finding saved .bin" (← (fdir / "saved" / "finding-0x42.bin").pathExists)
+    let findNoMin ← IO.Process.output {
+      cmd := fuzzBin.toString
+      args := #["--target", "finding", "--iterations", "50", "--seed", "66", "--no-minimize"]
+    }
+    checkEq "fuzz finding --no-minimize exits 1" findNoMin.exitCode 1
+    -- Coverage-guided corpus growth & `--no-guided`
+    let guidedOut ← IO.Process.output {
+      cmd := fuzzBin.toString
+      args := #["--target", "guided", "--iterations", "40", "--seed", "0x55", "--max-input", "32"]
+    }
+    checkEq "fuzz guided exits 0" guidedOut.exitCode 0
+    check "fuzz guided grew corpus" ((guidedOut.stdout.splitOn "corpus +").length > 1)
+    let noGuidedOut ← IO.Process.output {
+      cmd := fuzzBin.toString
+      args := #["--target", "guided", "--iterations", "20", "--no-guided"]
+    }
+    checkEq "fuzz --no-guided exits 0" noGuidedOut.exitCode 0
     -- 3. Unparseable seeds exit 1
     let noSeedOut ← IO.Process.output {
       cmd := fuzzBin.toString
@@ -1195,14 +1461,14 @@ def main : IO Unit := do
 
 private unsafe def testMutateEngineAndCLI : TM Unit := do
   -- 1. MutantKind & MutantOutcome JSON round-trips
-  for k in #[MutantKind.cmpFlip, .boolOpFlip, .boolLitFlip, .negRemove, .condNegate] do
+  for k in #[MutantKind.cmpFlip, .arithFlip, .boolOpFlip, .boolLitFlip, .negRemove, .condNegate] do
     checkEq s!"MutantKind ofString {k.toString}" (MutantKind.ofString? k.toString) (some k)
     let back : Except String MutantKind := fromJson? (toJson k)
     checkEq s!"MutantKind json {k.toString}" back.toOption (some k)
   checkEq "MutantKind unknown" (MutantKind.ofString? "nope") none
   check "MutantKind bad json" (fromJson? (Json.str "nope") : Except String MutantKind).toOption.isNone
 
-  for o in #[MutantOutcome.killed, .survived, .timeout, .uncompilable] do
+  for o in #[MutantOutcome.killed, .proved, .survived, .timeout, .uncompilable, .uncovered] do
     checkEq s!"MutantOutcome ofString {o.toString}" (MutantOutcome.ofString? o.toString) (some o)
     let back : Except String MutantOutcome := fromJson? (toJson o)
     checkEq s!"MutantOutcome json {o.toString}" back.toOption (some o)
@@ -1279,6 +1545,50 @@ end MutDemo
   check "has boolLitFlip" (allMs.any (·.kind == .boolLitFlip))
   check "has negRemove" (allMs.any (·.kind == .negRemove))
   check "has condNegate" (allMs.any (·.kind == .condNegate))
+  -- Arithmetic/bitwise operators + `-- leancov:ignore-mutant` + `--no-arith`
+  let arithSrc := "
+def arithOps (a b : Nat) : Nat :=
+  let s := (a + b) - (a * 2) / 3
+  let bw := (a &&& b) ||| (a <<< 1) >>> 1
+  let ign := a + b -- leancov:ignore-mutant
+  s + bw + ign
+"
+  let arithMs ← discoverMutantsInSource env "Arith.lean" arithSrc 0 #[] true
+  check "arithOps discovered >= 9 arith mutants" (arithMs.countP (·.kind == .arithFlip) ≥ 9)
+  check "leancov:ignore-mutant suppressed line 5" (!arithMs.any (·.line == 5))
+  let noArithMs ← discoverMutantsInSource env "Arith.lean" arithSrc 0 #[] false
+  checkEq "includeArith=false skips all arithFlip" (noArithMs.countP (·.kind == .arithFlip)) 0
+  checkEq "sampleMutants deterministic seed" (sampleMutants arithMs 4 (some 0x1234)) (sampleMutants arithMs 4 (some 0x1234))
+  checkEq "sampleMutants empty array" (sampleMutants #[] 4 (some 0x1234)).size 0
+  checkEq "sampleMutants unseeded" (sampleMutants arithMs 2 none).size 2
+  let diffMs := filterMutantsByGitDiff arithMs ((∅ : Std.HashMap String (Array Nat)).insert "Arith.lean" #[3])
+  check "filterMutantsByGitDiff keeps only line 3" (diffMs.all (·.line == 3) && diffMs.size > 0)
+  -- `pruneUncoveredMutants`: empty, line-hit kept, line-missed pruned, fn-level fallback hit/missed/empty, unknown decl kept
+  let (emptyPruneKeep, emptyPruneDrop) := pruneUncoveredMutants #[] {} #[]
+  check "prune empty" (emptyPruneKeep.isEmpty && emptyPruneDrop.isEmpty)
+  let pruneManifest : Manifest := {
+    sites := #[
+      { id := 0, file := "P.lean", decl := "P.hitLine", line := 10, col := 1, kind := .ifThen },
+      { id := 1, file := "P.lean", decl := "P.fnCov", line := 30, col := 1, kind := .ifThen },
+      { id := 2, file := "P.lean", decl := "P.fnUncov", line := 40, col := 1, kind := .ifThen }
+    ]
+    functions := #[
+      { name := "P.fnCov", file := "P.lean", line := 25, endLine := 32, lines := 8, cc := 2, cognitive := 1, siteIds := #[1] },
+      { name := "P.fnUncov", file := "P.lean", line := 35, endLine := 42, lines := 8, cc := 2, cognitive := 1, siteIds := #[2] },
+      { name := "P.fnNoSites", file := "P.lean", line := 45, endLine := 46, lines := 2, cc := 1, cognitive := 0, siteIds := #[] }
+    ]
+  }
+  let mkPruneMut (id line : Nat) (decl : String) : Mutant :=
+    { id, file := "P.lean", decl, line, col := 1, kind := .boolLitFlip, original := "true", replacement := "false", startByte := 0, endByte := 4, repText := "false" }
+  let (keptP, prunedP) := pruneUncoveredMutants #[
+    mkPruneMut 0 10 "P.hitLine",
+    mkPruneMut 1 26 "P.fnCov",
+    mkPruneMut 2 36 "P.fnUncov",
+    mkPruneMut 3 45 "P.fnNoSites",
+    mkPruneMut 4 50 "P.unknown"
+  ] pruneManifest #[3, 2, 0]
+  checkEq "prune kept 4 (hitLine, fnCov, fnNoSites, unknown)" keptP.size 4
+  checkEq "prune dropped 1 (fnUncov)" prunedP.size 1
   -- Every single spliced mutant must still parse cleanly as valid Lean 4 syntax!
   for m in allMs do
     let mutated := applyMutant mutSrc m
@@ -1301,8 +1611,9 @@ end MutDemo
   IO.FS.createDirAll (pkg / "Mini")
   IO.FS.writeFile (pkg / "lean-toolchain") (← IO.FS.readFile "lean-toolchain")
   IO.FS.writeFile (pkg / "lakefile.toml")
-    "name = \"mini\"\ndefaultTargets = [\"mini-test\"]\n[[lean_lib]]\nname = \"Mini\"\n[[lean_exe]]\nname = \"mini-test\"\nroot = \"Main\"\n"
+    "name = \"mini\"\ndefaultTargets = [\"mini-test\"]\n[[lean_lib]]\nname = \"Mini\"\n[[lean_lib]]\nname = \"MiniProofs\"\n[[lean_exe]]\nname = \"mini-test\"\nroot = \"Main\"\n"
   IO.FS.writeFile (pkg / "Mini.lean") "import Mini.Lib\nimport Mini.Spin\n"
+  IO.FS.writeFile (pkg / "MiniProofs.lean") "import Mini.Lib\ntheorem Mini.doubleVal_two : Mini.doubleVal 2 = 4 := by decide\n"
   IO.FS.writeFile (pkg / "Mini" / "Lib.lean") "namespace Mini
 
 -- Dependent `h : 0 < xs.size`: mutating `<` -> `≤` fails compilation (`uncompilable`)!
@@ -1317,6 +1628,14 @@ def isAdult (age : Nat) : Bool :=
 def strictGate (ok : Bool) : Bool :=
   ok && true
 
+-- Arithmetic proved by theorem in MiniProofs (`+` -> `-` fails `MiniProofs` -> PROVED!)
+def doubleVal (x : Nat) : Nat :=
+  x + x
+
+-- Never called by `mini-test` -> pruned as UNCOVERED when `--sites`/`--profile` is supplied!
+def deadBranch (n : Nat) : Bool :=
+  if n > 100 then true else false
+
 end Mini
 "
   IO.FS.writeFile (pkg / "Mini" / "Spin.lean") "namespace Mini
@@ -1330,6 +1649,7 @@ def main : IO UInt32 := do
   if safeFirst #[9] != 9 || safeFirst #[] != 0 then return 1
   if !isAdult 20 || isAdult 10 then return 1
   if !strictGate true || strictGate false then return 1
+  if doubleVal 2 != 4 then return 1
   return 0
 "
   let jsonPath := dir / "mutate.json"
@@ -1449,6 +1769,45 @@ def main : IO UInt32 := do
   checkEq "mutate zero timeout" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--timeout", "0", "--", "true"]) 2
   checkEq "mutate bad timeout" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--timeout", "abc", "--", "true"]) 2
   checkEq "mutate bad min-score" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--min-score", "abc", "--", "true"]) 2
+  -- Coverage-pruned + proof-aware + git-diff + seed mutation campaign on Mini
+  let covStage := dir / "cov_stage"
+  let covProf := dir / "cov.prof"
+  checkEq "stage mini for mutate pruning" (← LeanCov.CLI.runCLI [
+    "stage", "--pkg", pkg.toString, "--out", covStage.toString, "--src-dir", "Mini", "--exclude", "Main.lean"
+  ]) 0
+  let cb ← IO.Process.output { cmd := "lake", args := #["build", "mini-test"], cwd := some covStage }
+  check "mini-test instrumented built" (cb.exitCode == 0)
+  checkEq "run mini-test for pruning profile" (← LeanCov.CLI.runCLI [
+    "run", "--sites", (covStage / "sites.json").toString, "--profile", covProf.toString, "--",
+    (covStage / ".lake" / "build" / "bin" / "mini-test").toString
+  ]) 0
+  let proofJson := dir / "proof_mutate.json"
+  checkEq "mutate with --proof-target + --sites/--profile + --seed" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkg.toString, "--out", (dir / "work_proof").toString,
+    "--file", "Mini/Lib.lean", "--filter", "doubleVal,deadBranch", "--seed", "0x77",
+    "--build-target", "mini-test", "--proof-target", "MiniProofs",
+    "--sites", (covStage / "sites.json").toString, "--profile", covProf.toString,
+    "--json", proofJson.toString, "--min-score", "100.0",
+    "--", ".lake/build/bin/mini-test"
+  ]) 0
+  let pj ← needE "parse proof_mutate.json" id (Json.parse (← IO.FS.readFile proofJson))
+  check "recorded >= 1 proved mutant (doubleVal)" ((pj.getObjValAs? Nat "proved").toOption.getD 0 ≥ 1)
+  check "recorded >= 1 uncovered mutant (deadBranch)" ((pj.getObjValAs? Nat "uncovered").toOption.getD 0 ≥ 1)
+
+  -- Git-diff mutation filtering (`--git-diff HEAD`) & `--no-arith` & invalid flag paths
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", pkg.toString, "init"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", pkg.toString, "config", "user.email", "ci@example.com"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", pkg.toString, "config", "user.name", "CI"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", pkg.toString, "add", "."] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", pkg.toString, "commit", "-m", "base"] }
+  IO.FS.writeFile (pkg / "Mini" / "Spin.lean") "namespace Mini\ndef keepGoing : Bool := false\nend Mini\n"
+  checkEq "mutate --git-diff --no-arith on Spin.lean" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkg.toString, "--file", "Mini/Spin.lean", "--git-diff", "HEAD", "--no-arith", "--no-build", "--", "true"
+  ]) 0
+  checkEq "mutate bad --seed" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--seed", "nope", "--", "true"]) 2
+  checkEq "mutate --sites without --profile" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--sites", (covStage / "sites.json").toString, "--", "true"]) 2
+  checkEq "mutate --profile without --sites" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--profile", covProf.toString, "--", "true"]) 2
+
   checkEq "mutate unknown opt" (← LeanCov.CLI.runCLI ["mutate", "--bogus"]) 2
 
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }

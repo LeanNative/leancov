@@ -1,6 +1,11 @@
-/-! # Deterministic mutation fuzzer (`LeanCov.Fuzz`)
+import LeanCov.Runtime
+
+/-! # Deterministic coverage-guided mutation fuzzer (`LeanCov.Fuzz`)
 
 Seed-driven byte mutator with:
+- in-process AFL-bucket coverage feedback (`LeanCov.fuzzReset` / `fuzzCheckNew`) promoting
+  interesting mutants into a bounded dynamic corpus (disable with `--no-guided`);
+- automatic delta-debugging crash minimization before reporting/saving findings (`--no-minimize`);
 - child supervision under `LEAN_ABORT_ON_PANIC=1` (turning out-of-bounds panics into caught crashes);
 - a stall watchdog that kills hung parser calls and prints the exact replay command;
 - optional regression corpus replay (`<corpus>/<target>/*.bin`);
@@ -90,6 +95,8 @@ structure Options where
   target : Option String := none
   maxInput : Nat := 16384
   save : Option System.FilePath := none
+  guided : Bool := true
+  minimize : Bool := true
   deriving Inhabited
 
 private def hexDigit? (c : Char) : Option Nat :=
@@ -119,6 +126,8 @@ private def parseOptions : List String → Options → Except String Options
     | some n => parseOptions rest { o with maxInput := n }
     | none => throw s!"--max-input {v}"
   | "--save" :: v :: rest, o => parseOptions rest { o with save := some v }
+  | "--no-guided" :: rest, o => parseOptions rest { o with guided := false }
+  | "--no-minimize" :: rest, o => parseOptions rest { o with minimize := false }
   | other :: _, _ => throw s!"unknown argument {other}"
 
 private def seedHex (seed : UInt64) : String := "0x" ++ String.ofList (Nat.toDigits 16 seed.toNat)
@@ -134,14 +143,50 @@ private def say (line : String) : IO Unit := do
 private def replayLine (exe : String) (o : Options) (targets : String) (iteration : Nat) : String :=
   s!"{exe} --target {targets} --seed {seedHex o.seed} --max-input {o.maxInput} --iterations {iteration + 1}"
 
-private def attempt (t : Target) (rng : Rng) (input : ByteArray) (o : Options) (where_ : String) : IO Bool := do
+private def failsWith (t : Target) (cand : ByteArray) : IO Bool := do
+  let rng ← IO.mkRef 1
+  try
+    let _ ← t.check rng cand
+    return false
+  catch _ =>
+    return true
+
+/-- Delta-debugging shrinker: iteratively deletes chunks while `t.check` still throws. -/
+def minimizeInput (t : Target) (input : ByteArray) (budget : Nat := 128) : IO ByteArray := do
+  let mut best := input
+  let mut remaining := budget
+  let mut stride := max 1 (best.size / 2)
+  while stride > 0 && best.size > 1 && remaining > 0 do
+    let mut progressed := false
+    let mut i := 0
+    while i < best.size && best.size > 1 && remaining > 0 do
+      let delEnd := min best.size (i + stride)
+      let cand := best.extract 0 i ++ best.extract delEnd best.size
+      remaining := remaining - 1
+      if ← failsWith t cand then
+        best := cand
+        progressed := true
+      else
+        i := i + stride
+    if !progressed then
+      stride := stride / 2
+  return best
+
+private def attempt (t : Target) (rng : Rng) (input : ByteArray) (o : Options) (where_ : String)
+    (allowMinimize : Bool := false) : IO Bool := do
   try t.check rng input
   catch e =>
-    IO.eprintln s!"fuzz: FINDING target={t.name} {where_}: {e}"
-    if input.size ≤ 4096 then IO.eprintln s!"fuzz: input {hex input}"
+    let finalInput ←
+      if allowMinimize && o.minimize && input.size > 1 then minimizeInput t input
+      else pure input
+    let minNote :=
+      if finalInput.size < input.size then s!" (minimized {input.size}B -> {finalInput.size}B)"
+      else ""
+    IO.eprintln s!"fuzz: FINDING target={t.name} {where_}{minNote}: {e}"
+    if finalInput.size ≤ 4096 then IO.eprintln s!"fuzz: input {hex finalInput}"
     if let some dir := o.save then
       IO.FS.createDirAll dir
-      IO.FS.writeBinFile (dir / s!"{t.name}-{seedHex o.seed}.bin") input
+      IO.FS.writeBinFile (dir / s!"{t.name}-{seedHex o.seed}.bin") finalInput
     IO.Process.exit 1
 
 private def replayCorpus (targets : Array Target) (corpus : System.FilePath) (o : Options) : IO Nat := do
@@ -160,7 +205,17 @@ private def replayCorpus (targets : Array Target) (corpus : System.FilePath) (o 
 private structure Tally where
   took : Nat := 0
   slowestMs : Nat := 0
+  corpusAdds : Nat := 0
   deriving Inhabited
+
+private def maxDynamicCorpus : Nat := 512
+
+private def pickCorpusInput (corp : Array ByteArray) (seedCount : Nat) (rng : Rng) : IO ByteArray := do
+  if corp.size > seedCount && (← index rng 4) != 0 then
+    let recentStart := if corp.size - seedCount > 16 then corp.size - 16 else seedCount
+    let idx := recentStart + (← index rng (corp.size - recentStart))
+    return corp[idx]!
+  return corp[← index rng corp.size]!
 
 private def child (all : Array Target) (o : Options) (exe : String) (corpus : Option System.FilePath)
     (marker : System.FilePath) : IO UInt32 := do
@@ -185,28 +240,47 @@ private def child (all : Array Target) (o : Options) (exe : String) (corpus : Op
     unless anyTaken do
       IO.eprintln s!"fuzz: target={t.name}: no seed parses, so its fuzzing would only test refusals"
       return 1
-  say s!"fuzz: seed={seedHex o.seed} iterations={o.iterations} max-input={o.maxInput} targets={selection}"
+  say s!"fuzz: seed={seedHex o.seed} iterations={o.iterations} max-input={o.maxInput} targets={selection} guided={o.guided}"
+  if o.guided then LeanCov.fuzzReset ()
   let rng ← IO.mkRef o.seed
   let mut tallies : Array Tally := targets.map fun _ => {}
+  let mut corpora : Array (Array ByteArray) := targets.map (·.seeds)
   for iteration in [:o.iterations] do
     for h : k in [:targets.size] do
       let t := targets[k]'h.2.1
       IO.FS.writeFile marker s!"target={t.name} iteration={iteration}\n{replayLine exe o selection iteration}\n"
-      let seed := t.seeds[← index rng t.seeds.size]!
-      let input ← mutate seed rng o.maxInput t.tokens
+      let corp := corpora[k]!
+      let base ← pickCorpusInput corp t.seeds.size rng
+      let input ← mutate base rng o.maxInput t.tokens
       if let some dir := o.save then
         IO.FS.createDirAll dir
         IO.FS.writeBinFile (dir / "in-flight.bin") input
       let start ← IO.monoMsNow
-      let took ← attempt t rng input o s!"seed={seedHex o.seed} iteration={iteration}: replay: {replayLine exe o selection iteration}"
+      let took ← attempt t rng input o
+        s!"seed={seedHex o.seed} iteration={iteration}: replay: {replayLine exe o selection iteration}"
+        (allowMinimize := true)
       let ms := (← IO.monoMsNow) - start
+      let mut added : Nat := 0
+      if o.guided then
+        let newEdges ← LeanCov.fuzzCheckNew ()
+        if newEdges.toNat > 0 && corp.size < maxDynamicCorpus then
+          corpora := corpora.set! k (corp.push input)
+          added := 1
       tallies := tallies.modify k fun c =>
-        { took := c.took + (if took then 1 else 0), slowestMs := max c.slowestMs ms }
+        { took := c.took + (if took then 1 else 0)
+          slowestMs := max c.slowestMs ms
+          corpusAdds := c.corpusAdds + added }
   for h : k in [:targets.size] do
     let t := targets[k]'h.2.1
     let c := tallies[k]!
-    say s!"  {t.name}: took {c.took} of {o.iterations}, slowest {c.slowestMs} ms"
-  say s!"fuzz: passed {o.iterations * targets.size} cases and {replayed} corpus inputs (seed {seedHex o.seed})"
+    let corpNote := if c.corpusAdds > 0 then s!", corpus +{c.corpusAdds}" else ""
+    say s!"  {t.name}: took {c.took} of {o.iterations}{corpNote}, slowest {c.slowestMs} ms"
+  let covNote ←
+    if o.guided then
+      let cov ← LeanCov.fuzzCoveredSites ()
+      if cov.toNat > 0 then pure s!", {cov} sites covered" else pure ""
+    else pure ""
+  say s!"fuzz: passed {o.iterations * targets.size} cases and {replayed} corpus inputs (seed {seedHex o.seed}{covNote})"
   return 0
 
 /-- Seconds without progress before the parent supervisor kills the child as a hang finding. -/
@@ -241,7 +315,7 @@ def main (targets : Array Target) (args : List String) (corpus : Option System.F
   let options ← match parseOptions args {} with
     | .ok o => pure o
     | .error e =>
-      IO.eprintln s!"fuzz: {e}\nusage: fuzz [--iterations N] [--seed N|0xHEX] [--target NAME|all] [--max-input N] [--save DIR]"
+      IO.eprintln s!"fuzz: {e}\nusage: fuzz [--iterations N] [--seed N|0xHEX] [--target NAME|all] [--max-input N] [--save DIR] [--no-guided] [--no-minimize]"
       return 2
   let exe := (← IO.appPath).toString
   match ← IO.getEnv "LEANCOV_FUZZ_MARKER" with
