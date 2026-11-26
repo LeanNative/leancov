@@ -4,13 +4,13 @@ Source-level branch & line coverage, McCabe CRAP, SonarSource-style Cognitive Co
 
 Unlike C-level (`clang -fprofile-instr-generate`) coverage over Lean's generated C, `leancov` parses `.lean` files with Lean's own parser, injects minimal source-level probes into a staged out-of-tree copy, and records branch hits via a tiny POSIX C `mmap(MAP_SHARED)` runtime. That means:
 
-- **Zero C codegen noise & zero startup inflation** — no reference-counting reuse checks (`isShared`), monad bind plumbing, boxed trampolines, or inlined-away functions; pure 0-arg constants/CAFs are excluded, `leancov stage` arms `def main` with `LEAN_COV_DEFER_INIT=1` so module initializers produce 0.0% startup coverage, and `@[never_extract]` prevents Lean's compiler from hoisting constant-returning probes into `lean_once_cell_t` caches.
-- **Strict branch vs. function separation** — top-level branch coverage and LCOV `BRDA`/`BRF`/`BRH` count only genuine control-flow and boolean-operand outcomes (including `for`/`while` 0-iteration `loop.skip` and terminal `&&`/`||` RHS operands), never straight-line `fn.entry` probes.
+- **Zero C codegen noise & zero startup inflation** — no reference-counting reuse checks (`isShared`), monad bind plumbing, boxed trampolines, or inlined-away functions; pure 0-arg constants/CAFs (including precomputed `Id.run do` tables) are excluded by default (`--include-cafs` opts in), `leancov stage` arms `def main` with `LEAN_COV_DEFER_INIT=1` so module initializers produce 0.0% startup coverage, and `@[never_extract]` prevents Lean's compiler from hoisting constant-returning probes into `lean_once_cell_t` caches.
+- **Strict branch vs. function separation** — top-level branch coverage and LCOV `BRDA`/`BRF`/`BRH` count only genuine control-flow and boolean-operand outcomes (including `for`/`while` 0-iteration `loop.skip` when the collection is not statically non-empty, and terminal `&&`/`||` RHS operands), never straight-line `fn.entry` probes.
 - **Crash- and `SIGKILL`-safe counters** — atomic 64-bit increments directly into a shared memory-mapped `.cov` file survive panics, multi-process tests, and killed child processes.
 - **No `Lean` runtime dependency in tested binaries** — `LeanCov.Runtime` has zero `Lean` imports, and `LeanCov.DoSyntax` uses `public meta import Lean.Elab.Do` so instrumented executables link cleanly without `supportInterpreter := true`.
 - **Kernel & recursion compatible** — probes elaborate eagerly preserving `expectedType?`, metavariable order, `let mut`/`return`/`continue`/`break`, `Prop` erasure, `termination_by`, and structural recursion (`brecOn`).
 - **McCabe CRAP + Cognitive CRAP** — alongside classic `CRAP = CC²·(1-cov)³ + CC`, `leancov` computes nesting-weighted Cognitive Complexity (`CogCRAP = Cog²·(1-cov)³ + Cog`) so flat `match` tables stay low while deeply nested untested logic surfaces first.
-- **Standard outputs** — terminal tables, machine-readable JSON, and standard **LCOV** (`.info`) for `genhtml`, Codecov, Coveralls, and IDE gutters.
+- **Standard outputs** — terminal tables, standalone HTML source reports (`--html`), machine-readable JSON, GitHub-flavored Markdown (`--markdown`), and standard **LCOV** (`.info`) for `genhtml`, Codecov, Coveralls, and IDE gutters.
 
 ## Requirements
 
@@ -87,7 +87,7 @@ ln -sf "$(pwd)/.lake/build/bin/leancov" ~/.local/bin/leancov
 export PATH="$(pwd)/.lake/build/bin:$PATH"
 
 # Verify installation
-leancov --version   # prints: leancov 0.2.0
+leancov --version   # prints: leancov 0.3.0
 ```
 
 > **Note on toolchain lookup:** `leancov` walks up from its resolved executable path to find its own `lean-toolchain` and Lean sysroot, so symlinking `.lake/build/bin/leancov` works from any working directory. If you copy the binary out of the checkout, set `LEAN_SYSROOT="$(lean --print-prefix)"`.
@@ -154,14 +154,16 @@ Combine `.cov` shards into one `.cov` file with `leancov merge`:
 leancov merge --out build/merged.cov --profile-dir build/leancov-stage/profiles
 ```
 
-Merge one or more `.cov` profiles, print summary tables, missed site snippets (`--missed-detail`), execution hotspots (`--hot`), or git diff patch coverage (`--git-diff`), and export JSON, LCOV, or GitHub-flavored Markdown (`--markdown`):
+Merge one or more `.cov` profiles, print summary tables, filter by file/declaration/branch-kind (`--file`, `--decl`, `--exclude-kind`), inspect missed site snippets (`--missed-detail`) or execution hotspots (`--hot`), check git diff patch coverage (`--git-diff`), and export HTML (`--html`), JSON, LCOV, or GitHub-flavored Markdown (`--markdown`):
 
 ```sh
 leancov report \
   --sites build/leancov-stage/sites.json \
   --profile-dir build/leancov-stage/profiles \
-  --sort cog --files --kinds --missed-detail --hot --top 25 \
+  --sort cov --files --kinds --missed-detail --hot --top 25 \
+  --file MyLib/ --exclude-kind loop.skip \
   --git-diff origin/main --min-patch-cov 80.0 \
+  --html build/leancov-stage/html --src-root . \
   --json build/leancov-stage/coverage.json \
   --lcov build/leancov-stage/lcov.info \
   --markdown build/leancov-stage/report.md
@@ -177,11 +179,11 @@ leancov diff \
   --max-cov-drop 1.0 --max-crap-delta 5.0
 ```
 
-Sort modes: `--sort crap` (McCabe CRAP, default), `--sort cog` (Cognitive CRAP), `--sort cc` (McCabe CC), or `--sort uncov` (uncovered branch count). Generate browsable HTML from LCOV with `genhtml build/leancov-stage/lcov.info -o build/html`.
+Sort modes: `--sort crap` (McCabe CRAP, default), `--sort cog` (Cognitive CRAP), `--sort cc` (McCabe CC), `--sort uncov` (uncovered branch count), or `--sort cov` (lowest coverage first). Open `build/leancov-stage/html/index.html` directly in a browser (zero dependencies) or generate HTML from LCOV with `genhtml`.
 
 ### 5. AST-Guided, Coverage-Pruned & Proof-Aware Mutation Testing (`mutate`)
 
-`leancov mutate` parses computational declarations (`def`, `abbrev`, `instance`) with Lean's parser—skipping `theorem`s, `by` tactic proofs, type signatures, `termination_by` clauses, `have` obligations, attributes, and pattern binders—and evaluates semantics-changing mutants inside a clean out-of-tree staged copy:
+`leancov mutate` parses computational declarations (`def`, `abbrev`, `instance`) with Lean's parser—skipping `theorem`s, `by` tactic proofs, type signatures, `termination_by` clauses, `have` obligations, attributes, pattern binders, and `s!"..."` interpolated strings (opt in with `--include-interp`)—and evaluates semantics-changing mutants inside a clean out-of-tree staged copy:
 
 - **Comparison & equality flips:** `==` <-> `!=`, `<` <-> `≤`, `<=` -> `<`, `>` <-> `≥`, `>=` -> `>`
 - **Arithmetic & bitwise flips:** `+` <-> `-`, `*` <-> `/`, `&&&` <-> `|||`, `<<<` <-> `>>>` (disable with `--no-arith`)
@@ -200,6 +202,7 @@ leancov mutate \
   --timeout 30 \
   --min-score 80.0 \
   --json build/mutate.json \
+  --markdown build/mutate.md \
   -- .lake/build/bin/my-tests
 ```
 
@@ -312,9 +315,9 @@ Coverage-guided fuzzing uses in-process AFL edge-bucket feedback by default (`--
 ## Design Choices & Semantics
 
 - **`LEAN_COV_DEFER_INIT=1` + `main` arming:** `leancov stage` injects `LeanCov.arm ()` at entry to executable `def main` declarations (both top-level and inside the file's matching module namespace), and `leancov run` sets `LEAN_COV_DEFER_INIT=1` whenever `armOnMain: true`. Hits fired during `initialize_*` module startup before `main` runs are ignored so unexercised code never receives artificial startup coverage.
-- **Pure 0-arg CAF exclusion:** Zero-argument constant definitions (`def table := #[1, 2, 3]`) and pure-constant-only instances (`instance : Inhabited T where default := ...`) are excluded from function and branch denominators. Straight-line callable declarations (`def f (x : A) := ...`, point-free `fun` lambdas, `do` blocks, and callable `instance ... where` field implementations) receive an `fn.entry` probe that counts toward function/line coverage without inflating branch coverage.
+- **Pure 0-arg CAF exclusion:** Zero-argument value declarations whose initializers only run during module startup (`def table := #[1, 2, 3]`, `def sbox : ByteArray := Id.run do ...`, and pure-constant-only `instance ... where`) are excluded by default from function and branch denominators so `LEAN_COV_DEFER_INIT=1` never leaves precomputed tables at 0% (pass `--include-cafs` to include them). Straight-line callable declarations (`def f (x : A) := ...`, point-free `fun` lambdas, monadic `IO`/`StateM`/`ExceptT` actions, arrow-returning constants, and callable `instance ... where` field implementations) receive an `fn.entry` probe that counts toward function/line coverage without inflating branch coverage.
 - **`where` helper definitions folded into enclosing declarations:** Local `where` helpers are traversed as part of their parent declaration, folding their probe sites and McCabe/Cognitive complexity into the enclosing function rather than reporting synthetic auxiliary names separately.
-- **Inline (non-line-start) `for`/`while` loops:** Line-start `for` and `while` loops allocate a local flag to record both `loop.body` and 0-iteration `loop.skip`. Inline loops that do not begin at the start of a line (e.g., `else for x in xs do ...` on a single line) record `loop.body` without `loop.skip` so surrounding indentation-sensitive layout is never disturbed.
+- **Smart `loop.skip` on `for`/`while` loops:** Line-start `for` and `while` loops allocate a local flag to record both `loop.body` and 0-iteration `loop.skip`, except for `for` loops whose collection is statically guaranteed non-empty (`[a:b]`/`[:b]` with `a < b` and `step > 0`, or non-empty `[x, ...]` / `#[x, ...]` literals), where a `loop.skip` probe would be mathematically unreachable. Inline loops that do not begin at the start of a line (e.g., `else for x in xs do ...` on a single line) record `loop.body` without `loop.skip` so surrounding indentation-sensitive layout is never disturbed.
 
 ## Runtime Environment Variables
 

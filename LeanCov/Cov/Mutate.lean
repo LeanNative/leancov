@@ -173,6 +173,7 @@ private structure MutState where
   nextId : Nat
   decl : String := ""
   includeArith : Bool := true
+  includeInterp : Bool := false
   ignoredLines : Std.HashMap Nat Bool := {}
   mutants : Array Mutant := #[]
 
@@ -357,6 +358,7 @@ private partial def walkMutIfOrUnless? (k : SyntaxNodeKind) (args : Array Syntax
 
 private partial def walkMutNode (stx : Syntax) (k : SyntaxNodeKind) (args : Array Syntax) : MutM Unit := do
   if skipWalkKind k || skippedMutNodeKinds.contains k then return
+  if k == `interpolatedStrKind && !(← get).includeInterp then return
   if ← walkMutOp? stx k args then return
   if ← walkMutIfOrUnless? k args then return
   match k with
@@ -426,7 +428,8 @@ private partial def walkMutCommand (cmd : Syntax) (scopeStack : List (Bool × Li
 
 /-- Parse a `.lean` source file and return all AST-guided mutants in computational declarations. -/
 def discoverMutantsInSource (env : Environment) (relFile src : String) (startId : Nat := 0)
-    (filters : Array String := #[]) (includeArith : Bool := true) : IO (Array Mutant) := do
+    (filters : Array String := #[]) (includeArith : Bool := true)
+    (includeInterp : Bool := false) : IO (Array Mutant) := do
   let ic := mkInputContext src relFile
   let (_, pstate, msgs0) ← parseHeader ic
   if msgs0.hasErrors then return #[]
@@ -435,6 +438,7 @@ def discoverMutantsInSource (env : Environment) (relFile src : String) (startId 
   let init : MutState := {
     file := relFile, src, bytes := src.toUTF8, fileMap := ic.fileMap, nextId := startId,
     includeArith := includeArith,
+    includeInterp := includeInterp,
     ignoredLines := computeMutantIgnoredLines src
   }
   let run : MutM Unit := do
@@ -678,5 +682,34 @@ def formatMutateReport (r : MutateReport) : String := Id.run do
       let m := sr.mutant
       out := out.push s!"  SURVIVED {m.file}:{m.line}:{m.col}  {m.decl}  [{m.kind.toString}] `{m.original}` -> `{m.replacement}`"
   return "\n".intercalate out.toList
+
+/-- Format a mutation testing summary as GitHub-flavored Markdown. -/
+def formatMutateMarkdown (r : MutateReport) : String := Id.run do
+  let mut out : Array String := #[]
+  out := out.push "## LeanCov Mutation Report"
+  out := out.push ""
+  out := out.push "| Metric | Value |"
+  out := out.push "|---|---:|"
+  let capNote := if r.discovered > r.generated then s!" (sampled from {r.discovered})" else ""
+  out := out.push s!"| Generated | {r.generated}{capNote} |"
+  out := out.push s!"| Tested | {r.tested} |"
+  out := out.push s!"| Proved | {r.proved} |"
+  out := out.push s!"| Killed | {r.killed} |"
+  out := out.push s!"| Timeout | {r.timeout} |"
+  out := out.push s!"| Survived | {r.survived} |"
+  out := out.push s!"| Uncompilable | {r.uncompilable} |"
+  out := out.push s!"| Uncovered | {r.uncovered} |"
+  out := out.push s!"| Mutation Score | {round1Mut r.score}% |"
+  let survivors := r.results.filter (·.outcome == .survived)
+  if !survivors.isEmpty then
+    out := out.push ""
+    out := out.push s!"### Survived Mutants ({survivors.size})"
+    out := out.push ""
+    out := out.push "| Location | Declaration | Kind | Mutation |"
+    out := out.push "|---|---|---|---|"
+    for sr in survivors do
+      let m := sr.mutant
+      out := out.push s!"| `{m.file}:{m.line}:{m.col}` | `{m.decl}` | `{m.kind.toString}` | `{m.original}` -> `{m.replacement}` |"
+  return "\n".intercalate out.toList ++ "\n"
 
 end LeanCov.Cov

@@ -413,6 +413,7 @@ inductive SortKey where
   | cog
   | cc
   | uncov
+  | cov
   deriving BEq, Repr
 
 def SortKey.toString : SortKey → String
@@ -420,13 +421,47 @@ def SortKey.toString : SortKey → String
   | .cog => "cog"
   | .cc => "cc"
   | .uncov => "uncov"
+  | .cov => "cov"
 
 def SortKey.ofString? : String → Option SortKey
   | "crap" => some .crap
   | "cog" | "cog-crap" | "cognitive" => some .cog
   | "cc" => some .cc
   | "uncov" | "missed" => some .uncov
+  | "cov" | "low" => some .cov
   | _ => none
+
+/-- Subset filters and kind exclusions applied prior to aggregating reports. -/
+structure ReportFilter where
+  files : Array String := #[]
+  decls : Array String := #[]
+  excludeKinds : Array BranchKind := #[]
+  deriving Inhabited
+
+def ReportFilter.isEmpty (flt : ReportFilter) : Bool :=
+  flt.files.isEmpty && flt.decls.isEmpty && flt.excludeKinds.isEmpty
+
+private def matchesAnySubstr (pats : Array String) (s : String) : Bool :=
+  pats.isEmpty || pats.any fun p => !p.isEmpty && (s.splitOn p).length > 1
+
+/-- Filter manifest sites and functions without renumbering `Site.id`, preserving `.cov` counter alignment. -/
+def filterManifest (m : Manifest) (flt : ReportFilter) : Manifest := Id.run do
+  if flt.isEmpty then return m
+  let keptSites := m.sites.filter fun s =>
+    matchesAnySubstr flt.files s.file &&
+    matchesAnySubstr flt.decls s.decl &&
+    !flt.excludeKinds.contains s.kind
+  let mut keptIds : Std.HashMap Nat Bool := {}
+  for s in keptSites do
+    keptIds := keptIds.insert s.id true
+  let mut keptFns : Array FuncInfo := #[]
+  for f in m.functions do
+    if matchesAnySubstr flt.files f.file && matchesAnySubstr flt.decls f.name then
+      let fSites := f.siteIds.filter keptIds.contains
+      if !f.siteIds.isEmpty && fSites.isEmpty then
+        continue
+      keptFns := keptFns.push { f with siteIds := fSites }
+  return { m with sites := keptSites, functions := keptFns }
 
 /-- Sort function reports according to `key`. -/
 def sortFuncReports (fns : Array FuncReport) (key : SortKey) : Array FuncReport :=
@@ -446,6 +481,28 @@ def sortFuncReports (fns : Array FuncReport) (key : SortKey) : Array FuncReport 
       let ua := a.sitesTotal - a.sitesHit
       let ub := b.sitesTotal - b.sitesHit
       if ua != ub then ua > ub else a.crap > b.crap
+    | .cov =>
+      if a.branchCov != b.branchCov then a.branchCov < b.branchCov
+      else
+        let ua := a.sitesTotal - a.sitesHit
+        let ub := b.sitesTotal - b.sitesHit
+        if ua != ub then ua > ub
+        else if a.crap != b.crap then a.crap > b.crap
+        else a.name < b.name
+
+private def sortFileReports (files : Array FileReport) (sortBy : SortKey) : Array FileReport :=
+  files.qsort fun a b =>
+    if sortBy == .cov then
+      let aEmpty := a.sitesTotal == 0
+      let bEmpty := b.sitesTotal == 0
+      if aEmpty != bEmpty then !aEmpty
+      else if a.branchCov != b.branchCov then a.branchCov < b.branchCov
+      else
+        let ua := a.sitesTotal - a.sitesHit
+        let ub := b.sitesTotal - b.sitesHit
+        if ua != ub then ua > ub else a.file < b.file
+    else
+      if a.maxCogCrap != b.maxCogCrap then a.maxCogCrap > b.maxCogCrap else a.file < b.file
 
 /-- Format a human-readable terminal summary of coverage, CRAP, and Cognitive CRAP. -/
 def formatReport (r : SummaryReport) (topN : Nat := 25) (sortBy : SortKey := .crap)
@@ -471,8 +528,7 @@ def formatReport (r : SummaryReport) (topN : Nat := 25) (sortBy : SortKey := .cr
     out := out.push ""
     out := out.push "By file:"
     out := out.push s!"  {padLeft 7 "BrCov"} {padLeft 10 "Hit/Tot"} {padLeft 7 "LnCov"} {padLeft 7 "MaxCRAP"} {padLeft 7 "MaxCog"}  File"
-    let sortedFiles := r.files.qsort fun a b =>
-      if a.maxCogCrap != b.maxCogCrap then a.maxCogCrap > b.maxCogCrap else a.file < b.file
+    let sortedFiles := sortFileReports r.files sortBy
     for fr in sortedFiles do
       let br := if fr.sitesTotal == 0 then "n/a" else s!"{round1 (fr.branchCov * 100.0)}%"
       let ln := if fr.linesTotal == 0 then "n/a" else s!"{round1 (fr.lineCov * 100.0)}%"

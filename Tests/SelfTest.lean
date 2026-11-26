@@ -667,6 +667,94 @@ def oneArmedIgnore (b : Bool) (n : Nat) : IO Unit := do
   check "ignDemo kept non-ignored bool ops"
     (ignRes.sites.any (fun s => s.decl == "ignDemo" && s.kind == .andTrue))
 
+  -- Smart `loop.skip` suppression: non-empty literals omit `loop.skip`, empty/dynamic keep `loop.skip`
+  let loopSkipSrc := "
+def staticLoops (seed : Nat) : Nat := Id.run do
+  let mut s := seed
+  for i in [0:16] do s := s + i
+  for i in [:8] do s := s + i
+  for i in [1:5:2] do s := s + i
+  for i in [:8:2] do s := s + i
+  for x in [1, 2] do s := s + x
+  for x in #[1, 2] do s := s + x
+  for i in [0:4], x in [1] do s := s + i + x
+  return s
+
+def dynamicAndEmptyLoops (n : Nat) (xs : List Nat) : Nat := Id.run do
+  let mut s := 0
+  for i in [5:5] do s := s + i
+  for i in [:0] do s := s + i
+  for i in [0:4:0] do s := s + i
+  for i in [:8:0] do s := s + i
+  for i in [1:5:0] do s := s + i
+  for i in [:n] do s := s + i
+  for i in [0:n] do s := s + i
+  for i in [n:8] do s := s + i
+  for i in [:8:n] do s := s + i
+  for i in [1:5:n] do s := s + i
+  for x in ([] : List Nat) do s := s + x
+  for x in (#[] : Array Nat) do s := s + x
+  for x in xs do s := s + x
+  for i in [0:4], x in xs do s := s + i + x
+  return s
+"
+  let loopRes ← instrumentSource env "LoopSkip.lean" loopSkipSrc 0 {}
+  checkEq "loopSkipSrc parses cleanly" loopRes.skippedReason none
+  let staticSites := loopRes.sites.filter (·.decl == "staticLoops")
+  checkEq "staticLoops has 7 loop.body sites" (staticSites.countP (·.kind == .loopBody)) 7
+  checkEq "staticLoops has 0 loop.skip sites" (staticSites.countP (·.kind == .loopSkip)) 0
+  let dynSites := loopRes.sites.filter (·.decl == "dynamicAndEmptyLoops")
+  checkEq "dynamicAndEmptyLoops has 14 loop.body sites" (dynSites.countP (·.kind == .loopBody)) 14
+  checkEq "dynamicAndEmptyLoops has 14 loop.skip sites" (dynSites.countP (·.kind == .loopSkip)) 14
+
+  -- Pure 0-arg CAF exclusion (including `Id.run do` tables) vs callable 0-arg monads/arrows/callbacks
+  let cafSrc := "
+structure CbBox where
+  f : Bool → Nat
+
+def unannotCaf := 123
+
+def idRunTable : ByteArray := Id.run do
+  let mut b := ByteArray.empty
+  for i in [:4] do
+    b := b.push i.toUInt8
+  return b
+
+def matchCaf : Nat :=
+  match (some 1 : Option Nat) with
+  | some v => v
+  | none => 0
+
+def ioAct : IO Nat := do
+  return 1
+
+def customM : Id Nat := do
+  if true then return 1 else return 2
+
+def arrowFn : Nat → Nat :=
+  let k := 1
+  fun x => if x > k then x + k else 0
+
+def asciiArrowFn : Nat -> Nat :=
+  let k := 2
+  fun x => if x > k then x else 0
+
+def cbHolder : CbBox :=
+  { f := fun x => if x then 1 else 0 }
+"
+  let cafDefault ← instrumentSource env "Caf.lean" cafSrc 0 {}
+  check "unannotCaf excluded by default" (!cafDefault.functions.any (·.name == "unannotCaf"))
+  check "idRunTable CAF excluded by default" (!cafDefault.functions.any (·.name == "idRunTable"))
+  check "matchCaf CAF excluded by default" (!cafDefault.functions.any (·.name == "matchCaf"))
+  check "ioAct remains instrumented" (cafDefault.functions.any (·.name == "ioAct"))
+  check "customM remains instrumented" (cafDefault.functions.any (·.name == "customM"))
+  check "arrowFn remains instrumented" (cafDefault.functions.any (·.name == "arrowFn"))
+  check "asciiArrowFn remains instrumented" (cafDefault.functions.any (·.name == "asciiArrowFn"))
+  check "cbHolder remains instrumented" (cafDefault.functions.any (·.name == "cbHolder"))
+  let cafIncluded ← instrumentSource env "Caf.lean" cafSrc 0 { includeCafs := true }
+  check "idRunTable included when includeCafs=true" (cafIncluded.functions.any (·.name == "idRunTable"))
+  check "matchCaf included when includeCafs=true" (cafIncluded.functions.any (·.name == "matchCaf"))
+
 private def testReportAndLcov : TM Unit := do
   -- Mix real branches AND straight-line `fn.entry` to verify strict branch vs function separation
   let manifest : Manifest := {
@@ -704,7 +792,7 @@ private def testReportAndLcov : TM Unit := do
   check "byKind populated" (rep.byKind.size == 4)
 
   -- Verify all sort keys & formatting paths
-  for key in #[SortKey.crap, .cog, .cc, .uncov] do
+  for key in #[SortKey.crap, .cog, .cc, .uncov, .cov] do
     let txt := formatReport rep 10 key true true true
     check s!"formatReport({key.toString}) has summary" ((txt.splitOn "Branches:").length > 1)
     check s!"formatReport({key.toString}) has kinds" ((txt.splitOn "By branch kind:").length > 1)
@@ -714,7 +802,37 @@ private def testReportAndLcov : TM Unit := do
   checkEq "SortKey.ofString cog" (SortKey.ofString? "cog") (some .cog)
   checkEq "SortKey.ofString cc" (SortKey.ofString? "cc") (some .cc)
   checkEq "SortKey.ofString uncov" (SortKey.ofString? "uncov") (some .uncov)
+  checkEq "SortKey.ofString cov" (SortKey.ofString? "cov") (some .cov)
+  checkEq "SortKey.ofString low" (SortKey.ofString? "low") (some .cov)
   checkEq "SortKey.ofString bad" (SortKey.ofString? "nope") none
+  let covSorted := sortFuncReports rep.functions .cov
+  checkEq "SortKey.cov puts lowest branchCov first" covSorted[0]!.name "Foo.baz"
+
+  -- ReportFilter & filterManifest (--file, --decl, --exclude-kind) + HTML escape/filenames
+  let fltManifest : Manifest := {
+    sites := #[
+      { id := 0, file := "Alpha/A.lean", decl := "Alpha.f1", line := 5, col := 3, kind := .ifThen },
+      { id := 1, file := "Alpha/A.lean", decl := "Alpha.f1", line := 6, col := 3, kind := .loopSkip },
+      { id := 2, file := "Beta/B.lean", decl := "Beta.f2", line := 10, col := 3, kind := .loopSkip }
+    ]
+    functions := #[
+      { name := "Alpha.f1", file := "Alpha/A.lean", line := 4, endLine := 7, lines := 4, cc := 2, cognitive := 1, siteIds := #[0, 1] },
+      { name := "Beta.f2", file := "Beta/B.lean", line := 9, endLine := 12, lines := 4, cc := 2, cognitive := 1, siteIds := #[2] }
+    ]
+  }
+  checkEq "filterManifest empty is identity" (filterManifest fltManifest {}).sites.size 3
+  let fltByFile := filterManifest fltManifest { files := #["Alpha"] }
+  checkEq "filterManifest --file keeps Alpha sites" fltByFile.sites.size 2
+  checkEq "filterManifest --file keeps Alpha func" fltByFile.functions.size 1
+  let fltNoSkip := filterManifest fltManifest { excludeKinds := #[.loopSkip] }
+  checkEq "filterManifest --exclude-kind loop.skip keeps site 0" fltNoSkip.sites.size 1
+  checkEq "filterManifest preserves original Site.id" fltNoSkip.sites[0]!.id 0
+  checkEq "filterManifest drops Beta.f2 when all its sites excluded" fltNoSkip.functions.size 1
+  let fltEmpty := filterManifest fltManifest { decls := #["MissingDecl"] }
+  checkEq "filterManifest non-matching decl yields 0" fltEmpty.functions.size 0
+
+  checkEq "htmlEscape" (htmlEscape "<a & \"b\" 'c'>") "&lt;a &amp; &quot;b&quot; &#39;c&#39;&gt;"
+  checkEq "safeHtmlFileName" (safeHtmlFileName "Winnow/Sha2.lean") "Winnow__Sha2.lean.html"
 
   let statCog := formatStaticAnalysis manifest 10 true
   let statCC := formatStaticAnalysis manifest 10 false
@@ -769,9 +887,15 @@ private def testReportAndLcov : TM Unit := do
   let tieRep := buildReport tieManifest #[0, 0, 0, 1, 0, 1]
   check "tieRep crapOver30 >= 3" (tieRep.crapOver30 ≥ 3)
   check "tieRep cogCrapOver30 >= 4" (tieRep.cogCrapOver30 ≥ 4)
-  for key in #[SortKey.crap, .cog, .cc, .uncov] do
+  for key in #[SortKey.crap, .cog, .cc, .uncov, .cov] do
     let txt := formatReport tieRep 12 key true true true
     check s!"tie formatReport({key.toString})" ((txt.splitOn "T.a").length > 1)
+  let covTieFileTxt := formatReport tieRep 12 .cov true false false
+  check "formatReport .cov with multiple files" ((covTieFileTxt.splitOn "OnlyFn.lean").length > 1)
+  let emptyHtmlDir := ".lake/build/tmp_empty_html"
+  writeHtmlReport ⟨emptyHtmlDir⟩ ⟨"."⟩ {} #[] emptyRep
+  check "empty writeHtmlReport wrote index" (← ((⟨emptyHtmlDir⟩ : System.FilePath) / "index.html").pathExists)
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", emptyHtmlDir] }
   check "formatReport showMissed=false" (((formatReport tieRep 5 .crap false false false).splitOn "missed lines:").length == 1)
   check "formatReport topN=0 omits table" (((formatReport tieRep 0 .crap false false false).splitOn "Top ").length == 1)
   check "staticAnalysis >15 counters" (((formatStaticAnalysis tieManifest 10 true).splitOn "(>15:").length > 1)
@@ -1596,6 +1720,11 @@ def arithOps (a b : Nat) : Nat :=
     let r ← instrumentSource env "MutatedCheck.lean" mutated 0 { analyzeOnly := true }
     checkEq s!"mutant #{m.id} ({m.original} -> {m.replacement}) parses cleanly" r.skippedReason none
 
+  let ignMsDefault ← discoverMutantsInSource env "Interp.lean" "def msg (a b : Nat) (ok : Bool) : String := s!\"sum={a + b} ok={!ok}\"\n" 0 #[] true false
+  checkEq "interpolatedStr mutations skipped by default" ignMsDefault.size 0
+  let ignMsInc ← discoverMutantsInSource env "Interp.lean" "def msg (a b : Nat) (ok : Bool) : String := s!\"sum={a + b} ok={!ok}\"\n" 0 #[] true true
+  check "interpolatedStr mutations included when includeInterp=true" (ignMsInc.size ≥ 2)
+
   let filtMs ← discoverMutantsInSource env "MutDemo.lean" mutSrc 0 #["", "m2"]
   checkEq "filtered to m2 only" filtMs.size 1
   checkEq "m2 mutant decl" filtMs[0]!.decl "MutDemo.m2"
@@ -1653,17 +1782,23 @@ def main : IO UInt32 := do
   return 0
 "
   let jsonPath := dir / "mutate.json"
+  let mdPath := dir / "mutate.md"
   let workDir := dir / "work"
   -- Run with --min-score 95.0 -> must exit 1 because `isAdult` boundary mutant (`>=` -> `>`) survives!
   let codeFail ← LeanCov.CLI.runCLI [
     "mutate", "--pkg", pkg.toString, "--out", workDir.toString,
     "--file", "Mini/Lib.lean", "--build-target", "mini-test",
-    "--json", jsonPath.toString, "--min-score", "95.0",
+    "--json", jsonPath.toString, "--markdown", mdPath.toString, "--min-score", "95.0",
     "--", ".lake/build/bin/mini-test"
   ]
   checkEq "mutate exits 1 when below --min-score 95" codeFail 1
   check "workDir cleaned up without --keep-work" (!(← workDir.pathExists))
   check "mutate wrote json" (← jsonPath.pathExists)
+  check "mutate wrote markdown" (← mdPath.pathExists)
+  let mdMutTxt ← IO.FS.readFile mdPath
+  check "mutate markdown lists Survived Mutants" ((mdMutTxt.splitOn "### Survived Mutants").length > 1)
+  let passMd := formatMutateMarkdown (summarizeMutateResults 1 #[{ mutant := { id := 0, file := "A.lean", decl := "f", line := 1, col := 1, kind := .boolLitFlip, original := "true", replacement := "false", startByte := 0, endByte := 4, repText := "false" }, outcome := .killed, elapsedMs := 1 }])
+  check "formatMutateMarkdown 0 survivors omits table" ((passMd.splitOn "### Survived Mutants").length == 1)
   let jRaw ← IO.FS.readFile jsonPath
   let jObj ← needE "parse mutate.json" id (Json.parse jRaw)
   let uncomp ← needE "uncompilable field" id (jObj.getObjValAs? Nat "uncompilable")
@@ -1801,8 +1936,8 @@ def main : IO UInt32 := do
   let _ ← IO.Process.output { cmd := "git", args := #["-C", pkg.toString, "add", "."] }
   let _ ← IO.Process.output { cmd := "git", args := #["-C", pkg.toString, "commit", "-m", "base"] }
   IO.FS.writeFile (pkg / "Mini" / "Spin.lean") "namespace Mini\ndef keepGoing : Bool := false\nend Mini\n"
-  checkEq "mutate --git-diff --no-arith on Spin.lean" (← LeanCov.CLI.runCLI [
-    "mutate", "--pkg", pkg.toString, "--file", "Mini/Spin.lean", "--git-diff", "HEAD", "--no-arith", "--no-build", "--", "true"
+  checkEq "mutate --git-diff --no-arith --include-interp on Spin.lean" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", pkg.toString, "--file", "Mini/Spin.lean", "--git-diff", "HEAD", "--no-arith", "--include-interp", "--no-build", "--", "true"
   ]) 0
   checkEq "mutate bad --seed" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--seed", "nope", "--", "true"]) 2
   checkEq "mutate --sites without --profile" (← LeanCov.CLI.runCLI ["mutate", "--file", "Mini/Lib.lean", "--sites", (covStage / "sites.json").toString, "--", "true"]) 2
@@ -1812,6 +1947,61 @@ def main : IO UInt32 := do
 
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
 
+private unsafe def testV030CLI : TM Unit := do
+  let dir : System.FilePath := ".lake/build/tmp_v030_cli"
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+  let pkg := dir / "pkg"
+  IO.FS.createDirAll (pkg / "Mod")
+  IO.FS.writeFile (pkg / "lakefile.toml") "name = \"v030\"\n[[lean_lib]]\nname = \"Mod\"\n"
+  IO.FS.writeFile (pkg / "Mod" / "Logic.lean")
+    "def f (x : Nat) : Nat := if x > 0 then x else 0\n\ndef full (x : Nat) : Nat := if x > 0 then x else 0\n\ndef tbl : Nat := Id.run do\n  let mut s := 0\n  for i in [:4] do\n    s := s + i\n  return s"
+  IO.FS.writeFile (pkg / "Mod" / "Empty.lean") "def lin (x : Nat) : Nat := x + 1\n"
+  let sitesPath := dir / "sites.json"
+  let profPath := dir / "prof.cov"
+  checkEq "stage default excludes CAF" (← LeanCov.CLI.runCLI [
+    "stage", "--pkg", pkg.toString, "--out", (dir / "stage_default").toString, "--leancov", ".", "--src-dir", "Mod"
+  ]) 0
+  checkEq "stage --include-cafs" (← LeanCov.CLI.runCLI [
+    "stage", "--pkg", pkg.toString, "--out", (dir / "stage_cafs").toString, "--leancov", ".", "--src-dir", "Mod", "--include-cafs"
+  ]) 0
+  checkEq "instrument --include-cafs" (← LeanCov.CLI.runCLI [
+    "instrument", "--src", (pkg / "Mod").toString, "--out", (dir / "inst_cafs").toString, "--sites", sitesPath.toString, "--include-cafs"
+  ]) 0
+  let m ← needE "parse v030 sites" id (Json.parse (← IO.FS.readFile sitesPath) >>= fromJson? : Except String Manifest)
+  check "instrument --include-cafs includes tbl" (m.functions.any (·.name == "tbl"))
+  let mut hits := Array.replicate m.sites.size (0 : UInt64)
+  -- Hit site 0 (part of line 1: f if.then hit, if.else missed -> ln-part + warn 50%) and full (100% -> ln-hit + ok)
+  if hits.size ≥ 5 then
+    hits := (hits.set! 0 3).set! 2 2 |>.set! 3 2 |>.set! 4 1
+  writeProfile profPath hits
+  let htmlDir := dir / "html_ok"
+  checkEq "report --html + --sort cov + --files" (← LeanCov.CLI.runCLI [
+    "report", "--sites", sitesPath.toString, "--profile", profPath.toString,
+    "--files", "--sort", "cov", "--html", htmlDir.toString, "--src-root", (pkg / "Mod").toString
+  ]) 0
+  check "html wrote index.html" (← (htmlDir / "index.html").pathExists)
+  let logicHtml := htmlDir / "files" / (safeHtmlFileName "Logic.lean")
+  check "html wrote source page" (← logicHtml.pathExists)
+  let logicTxt ← IO.FS.readFile logicHtml
+  check "html source has line anchor, part/hit/miss & badge" (
+    (logicTxt.splitOn "id=\"L1\"").length > 1 &&
+    (logicTxt.splitOn "ln-part").length > 1 &&
+    (logicTxt.splitOn "ln-hit").length > 1 &&
+    (logicTxt.splitOn "badge").length > 1
+  )
+  let htmlMiss := dir / "html_miss"
+  checkEq "report --file + --decl + --exclude-kind + missing src" (← LeanCov.CLI.runCLI [
+    "report", "--sites", sitesPath.toString, "--profile", profPath.toString,
+    "--file", "Logic.lean", "--decl", "f", "--exclude-kind", "if.else",
+    "--html", htmlMiss.toString, "--src-root", (dir / "missing_root").toString
+  ]) 0
+  let missTxt ← IO.FS.readFile (htmlMiss / "files" / (safeHtmlFileName "Logic.lean"))
+  check "html missing src renders notice" ((missTxt.splitOn "Source file not found").length > 1)
+  checkEq "report invalid --exclude-kind exits 2" (← LeanCov.CLI.runCLI [
+    "report", "--sites", sitesPath.toString, "--profile", profPath.toString, "--exclude-kind", "bogus"
+  ]) 2
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+
 unsafe def main : IO UInt32 :=
   runMain "leancov-test" do
     runTest "types & binary profiles" testTypesAndProfiles
@@ -1819,6 +2009,7 @@ unsafe def main : IO UInt32 :=
     runTest "AST instrumentation, runtime semantics & armMain" testInstrumentAndRuntimeSemantics
     runTest "report, kinds & LCOV" testReportAndLcov
     runTest "CLI subcommands end-to-end" testCLISubcommands
+    runTest "v0.3.0 filtering, HTML & CAF CLI" testV030CLI
     runTest "fuzz primitives & mutator" testFuzzPrimitives
     runTest "exact binary runtime counters (ground truth)" testExactRuntimeCounters
     runTest "AST mutation engine & mutate CLI" testMutateEngineAndCLI

@@ -86,6 +86,8 @@ structure InstrumentConfig where
   extraImports : Array Name := #[]
   /-- Whether to also instrument `&&` and `||` short-circuit conditions. -/
   instrumentBoolOps : Bool := true
+  /-- Whether to instrument pure 0-argument module-init CAFs (skipped by default). -/
+  includeCafs : Bool := false
   /-- When `true`, only measure complexity and sites without writing instrumented files. -/
   analyzeOnly : Bool := false
   /-- When `true`, also arm entry `def main` declarations on the same parsed AST pass. -/
@@ -103,6 +105,7 @@ private structure FileState where
   edits : Array Edit := #[]
   decl : String := ""
   instrumentBoolOps : Bool := true
+  includeCafs : Bool := false
   ignoredLines : Std.HashMap Nat Bool := {}
 
 private abbrev InstM := StateM FileState
@@ -330,6 +333,51 @@ private def skippedWalkKinds : Array SyntaxNodeKind := #[
 def skipWalkKind (k : SyntaxNodeKind) : Bool :=
   skippedWalkKinds.contains k
 
+private def natLit? (s : Syntax) : Option Nat :=
+  let u := unwrapParen s
+  if u.getKind == `num && u.getNumArgs ≥ 1 then
+    match u.getArg 0 with
+    | .atom _ val => (val.replace "_" "").toNat?
+    | _ => none
+  else none
+
+private def rangeNat? (args : Array Syntax) (idx : Nat) : Option Nat :=
+  if h : idx < args.size then natLit? args[idx] else none
+
+private def isStaticallyNonEmptyColl (s : Syntax) : Bool :=
+  let u := unwrapParen s
+  let args := u.getArgs
+  let nonEmptyRange : Option Bool :=
+    match u.getKind with
+    | `Std.Legacy.Range.«term[:_]» => do
+      let b ← rangeNat? args 2
+      pure (b > 0)
+    | `Std.Legacy.Range.«term[_:_]» => do
+      let a ← rangeNat? args 1
+      let b ← rangeNat? args 3
+      pure (a < b)
+    | `Std.Legacy.Range.«term[:_:_]» => do
+      let b ← rangeNat? args 2
+      let step ← rangeNat? args 4
+      pure (b > 0 && step > 0)
+    | `Std.Legacy.Range.«term[_:_:_]» => do
+      let a ← rangeNat? args 1
+      let b ← rangeNat? args 3
+      let step ← rangeNat? args 5
+      pure (a < b && step > 0)
+    | _ => none
+  match nonEmptyRange with
+  | some ok => ok
+  | none =>
+    (u.getKind == `«term[_]» || u.getKind == `«term#[_,]» ) && args.size ≥ 3 && args[1]!.getNumArgs > 0
+
+private def isStaticallyNonEmptyFor (stx : Syntax) : Bool :=
+  if stx.getKind != `Lean.Parser.Term.doFor || stx.getNumArgs < 2 then false
+  else
+    let decls := (stx.getArg 1).getArgs.filter (·.getKind == `Lean.Parser.Term.doForDecl)
+    !decls.isEmpty && decls.all fun d =>
+      d.getNumArgs > 0 && isStaticallyNonEmptyColl (d.getArg (d.getNumArgs - 1))
+
 mutual
 
 private partial def walkTermIf (k : SyntaxNodeKind) (args : Array Syntax) (nesting : Nat) : InstM Unit := do
@@ -432,9 +480,11 @@ private partial def walkDoLoop (stx : Syntax) (args : Array Syntax) (nesting : N
       | some la => isPosIgnored la
       | none => pure false
     unless loopIgnored do
-      let trackSkip ← match stx.getPos?, stx.getTailPos? with
-        | some la, some _ => isLineStart la.byteIdx
-        | _, _ => pure false
+      let trackSkip ←
+        if isStaticallyNonEmptyFor stx then pure false
+        else match stx.getPos?, stx.getTailPos? with
+          | some la, some _ => isLineStart la.byteIdx
+          | _, _ => pure false
       match trackSkip, firstDoItemSpan? a, stx.getPos?, stx.getTailPos? with
       | true, some (ba, bb), some la, some lb =>
         let bodyId ← allocSite ba .loopBody nesting
@@ -617,6 +667,53 @@ private def headerIsModule (hdr : Syntax) : Bool :=
 private def hasSigBinders (sigStx : Syntax) : Bool :=
   sigStx.getNumArgs ≥ 1 && (sigStx.getArg 0).getNumArgs > 0
 
+private def deferredReturnPrefixes : Array String := #[
+  "IO", "BaseIO", "EIO", "EST", "StateM", "StateT", "StateRefT",
+  "ReaderM", "ReaderT", "ExceptT", "OptionT", "Task",
+  "CommandElabM", "TermElabM", "MetaM", "CoreM", "MacroM"
+]
+
+private def sigHasArrowOrDeferredReturn (sig : Syntax) (src : String) : Bool :=
+  match findTypeSpec sig with
+  | none => false
+  | some ts =>
+    match ts.getPos?, ts.getTailPos? with
+    | some a, some b =>
+      let bytes := src.toUTF8
+      let raw := String.fromUTF8! (bytes.extract a.byteIdx (min b.byteIdx bytes.size))
+      let afterColon := (raw.drop 1).toString.trimAscii.copy
+      containsSubstr afterColon "→" || containsSubstr afterColon "->" ||
+        deferredReturnPrefixes.any fun p =>
+          afterColon == p || afterColon.startsWith (p ++ " ") || afterColon.startsWith (p ++ ".")
+    | _, _ => false
+
+private def isIdRunApp (s : Syntax) : Bool :=
+  let u := unwrapParen s
+  if u.getKind == `Lean.Parser.Term.app && u.getNumArgs ≥ 1 then
+    match unwrapParen (u.getArg 0) with
+    | .ident _ _ n _ => n.toString == "Id.run"
+    | _ => false
+  else false
+
+private partial def containsDeferredNode (s : Syntax) : Bool :=
+  match s with
+  | .node _ k args =>
+    if skipWalkKind k then false
+    else if k == `Lean.Parser.Term.do || k == `Lean.Parser.Term.fun then true
+    else args.any containsDeferredNode
+  | _ => false
+
+/-- True for pure 0-argument value declarations whose initializer only runs during module startup
+(e.g. lookup tables via `Id.run do`), so `LEAN_COV_DEFER_INIT=1` will not leave them at 0%. -/
+def isPureModuleInitCaf (isDef : Bool) (sigStx valStx : Syntax) (src : String) : Bool :=
+  if !isDef || hasSigBinders sigStx || valStx.getKind != `Lean.Parser.Command.declValSimple || valStx.getNumArgs < 2 then
+    false
+  else if sigHasArrowOrDeferredReturn sigStx src then
+    false
+  else
+    let body := unwrapParen (valStx.getArg 1)
+    isIdRunApp body || !containsDeferredNode body
+
 /-- True if `valStx` is a `fun x => rhs` whose inner `rhs` we can wrap with `.fnEntry`. -/
 private def basicFunRhs? (body : Syntax) : Option Syntax :=
   if body.getKind == `Lean.Parser.Term.fun && body.getNumArgs ≥ 2 then
@@ -689,6 +786,7 @@ private def instrumentDecl (ns : List String) (cmd : Syntax) (mods inner : Synta
   let isDef := inner.getKind == `Lean.Parser.Command.definition
   if isNonComputationalSig sigStx s.src then return none
   if isTacticBody valStx then return none
+  if !s.includeCafs && isPureModuleInitCaf isDef sigStx valStx s.src then return none
   -- Compute complexity and line range from original AST
   let comp := measureComplexity valStx
   let (startLine, endLine) := match inner.getPos?, cmd.getTailPos? with
@@ -945,6 +1043,7 @@ def instrumentSource (env : Environment) (relFile src : String) (startSiteId : N
   let initState : FileState := {
     file := relFile, src, fileMap := ic.fileMap, nextSiteId := startSiteId,
     instrumentBoolOps := cfg.instrumentBoolOps,
+    includeCafs := cfg.includeCafs,
     ignoredLines := ignored
   }
   let run : InstM (Array FuncInfo) := do
