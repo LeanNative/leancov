@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to package and publish (e.g. v0.4.0)"
+        description: "Release tag to package and publish (e.g. v0.5.0)"
         required: true
         type: string
 
@@ -43,7 +43,7 @@ jobs:
           lake build leancov leancov-rt-test leancov-test leancov-fuzz-test
           .lake/build/bin/leancov --version
           .lake/build/bin/leancov-rt-test
-          .lake/build/bin/leancov-test
+          lake test
 
       - name: Package tarball
         shell: bash
@@ -55,7 +55,28 @@ jobs:
           mkdir -p "$STAGE/bin" "$STAGE/c" "$STAGE/LeanCov"
           cp .lake/build/bin/leancov "$STAGE/bin/leancov"
           chmod +x "$STAGE/bin/leancov"
-          cp lean-toolchain lakefile.lean LICENSE README.md "$STAGE/"
+          cp lean-toolchain LICENSE README.md "$STAGE/"
+          cat > "$STAGE/lakefile.lean" <<'EOF'
+          import Lake
+          open Lake DSL
+
+          package «leancov» where
+
+          target leancov_rt.o pkg : System.FilePath := do
+            let oFile := pkg.buildDir / "c" / "leancov_rt.o"
+            let srcJob ← inputTextFile <| pkg.dir / "c" / "leancov_rt.c"
+            let weakArgs := #["-I", (← getLeanIncludeDir).toString]
+            buildO oFile srcJob weakArgs #["-fPIC", "-O2", "-std=c11", "-Wall", "-Wextra"] "cc" getLeanTrace
+
+          extern_lib libleancov_rt pkg := do
+            let name := nameToStaticLib "leancov_rt"
+            let rtO ← leancov_rt.o.fetch
+            buildStaticLib (pkg.staticLibDir / name) #[rtO]
+
+          lean_lib «LeanCov» where
+            roots := #[`LeanCov.Runtime, `LeanCov.DoSyntax, `LeanCov.Check, `LeanCov.Fuzz]
+            precompileModules := true
+          EOF
           cp c/leancov_rt.c "$STAGE/c/leancov_rt.c"
           for f in Runtime.lean DoSyntax.lean Check.lean Fuzz.lean; do
             cp "LeanCov/$f" "$STAGE/LeanCov/$f"
@@ -68,6 +89,51 @@ jobs:
             (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
           fi
           ls -lh dist/
+
+      - name: Smoke-test release tarball
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TARGET="${{ matrix.target }}"
+          TMP="$(mktemp -d)"
+          tar -xzf "dist/leancov-${TAG}-${TARGET}.tar.gz" -C "$TMP"
+          mkdir -p "$TMP/proj/Demo"
+          cp lean-toolchain "$TMP/proj/lean-toolchain"
+          cat > "$TMP/proj/lakefile.toml" <<'EOF'
+          name = "demo"
+          defaultTargets = ["demo-test"]
+          [[lean_lib]]
+          name = "Demo"
+          [[lean_exe]]
+          name = "demo-test"
+          root = "Main"
+          EOF
+          cat > "$TMP/proj/Demo.lean" <<'EOF'
+          import Demo.Core
+          EOF
+          cat > "$TMP/proj/Demo/Core.lean" <<'EOF'
+          def f (x : Nat) : Nat := if x > 0 then x else 0
+          EOF
+          cat > "$TMP/proj/Main.lean" <<'EOF'
+          import Demo
+          def main : IO UInt32 := if f 1 == 1 then pure 0 else pure 1
+          EOF
+          cat > "$TMP/proj/leancov.toml" <<'EOF'
+          [leancov]
+          out = "build/cov"
+          min_cov = 40.0
+          [[package]]
+          name = "demo"
+          pkg = "."
+          src_dirs = ["Demo"]
+          exclude = ["Main.lean"]
+          [[suite]]
+          name = "demo-test"
+          package = "demo"
+          EOF
+          "$TMP/leancov/bin/leancov" --version
+          "$TMP/leancov/bin/leancov" test --config "$TMP/proj/leancov.toml" --clean
+          rm -rf "$TMP"
 
       - name: Upload bundle
         uses: actions/upload-artifact@v4

@@ -2217,7 +2217,39 @@ fast = false
   check "leancov test wrote markdown" (← (dir / "out" / "report.md").pathExists)
   checkEq "leancov test --report subset" (← LeanCov.CLI.runCLI [
     "test", "--config", cfgPath.toString, "--report", "--jobs", "2", "--sort", "cog", "--top", "5",
+    "--html", (dir / "out" / "custom_html").toString, "--markdown", (dir / "out" / "custom.md").toString,
     "--exclude-instances", "--min-cov", "0.0", "--max-crap", "100.0", "--max-cog-crap", "100.0", "suite-ok"
+  ]) 0
+  let cfg2Path := dir / "leancov2.toml"
+  IO.FS.writeFile cfg2Path "
+[leancov]
+out = \"out\"
+files = false
+kinds = false
+html = false
+markdown = false
+exclude_instances = false
+exclude_kinds = [\"fn.entry\"]
+[[package]]
+name = \"pkga\"
+pkg = \"PkgA\"
+exclude = [\"NoMatch.lean\"]
+imports = [\"Init\"]
+bool_ops = false
+include_cafs = true
+[[suite]]
+name = \"suite-ok\"
+package = \"pkga\"
+fast = true
+"
+  checkEq "leancov test cfg2 --report --fast" (← LeanCov.CLI.runCLI [
+    "test", "--config", cfg2Path.toString, "--report", "--fast"
+  ]) 0
+  checkEq "leancov test --report invalid unknown-suite exits 2" (← LeanCov.CLI.runCLI [
+    "test", "--config", cfgPath.toString, "--report", "suite-ok"
+  ]) 0
+  checkEq "leancov test --clean --no-build unknown fails? noBuild all options" (← LeanCov.CLI.runCLI [
+    "test", "--config", cfg2Path.toString, "--leancov", ".", "suite-ok"
   ]) 0
   checkEq "leancov test --no-build suite-fail exits 1" (← LeanCov.CLI.runCLI [
     "test", "--config", cfgPath.toString, "--no-build", "--leancov", ".", "suite-fail"
@@ -2252,6 +2284,127 @@ fast = false
     checkEq s!"bad test args {badTestArgs}" (← LeanCov.CLI.runCLI badTestArgs) 2
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
 
+private unsafe def testV050Features : TM Unit := do
+  let env ← loadParserEnv
+  -- 1. `const.boundary` and `result.flip` operators + alias parsing
+  for (tok, k) in #[
+    ("const", MutantKind.constBoundary), ("const.boundary", .constBoundary),
+    ("result", .resultFlip), ("result.flip", .resultFlip)
+  ] do
+    checkEq s!"ofAlias? {tok}" (MutantKind.ofAlias? tok) (some k)
+  let mutSrc := "
+def chkOpt (n : Nat) : Option Nat :=
+  if 0 < n && n != 1 then some (n + 1) else none
+"
+  let ms ← discoverMutantsInSource env "OptMut.lean" mutSrc 0
+  check "discovered const.boundary 0->1 and 1->0" (
+    ms.any (fun m => m.kind == .constBoundary && m.original == "0" && m.replacement == "1") &&
+    ms.any (fun m => m.kind == .constBoundary && m.original == "1" && m.replacement == "0")
+  )
+  check "discovered result.flip some->none" (ms.any (fun m => m.kind == .resultFlip && m.replacement == "none"))
+  for m in ms do
+    let r ← instrumentSource env "OptMutChk.lean" (applyMutant mutSrc m) 0 { analyzeOnly := true }
+    checkEq s!"v050 mutant #{m.id} parses cleanly" r.skippedReason none
+
+  -- 2. Interactive `writeMutateHtml` + `leancov mutate --html`
+  let dir : System.FilePath := ".lake/build/tmp_v050_test"
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+  IO.FS.createDirAll dir
+  let sampleMutRes := summarizeMutateResults 5 #[
+    { mutant := ms[0]!, outcome := .killed, elapsedMs := 12 },
+    { mutant := ms[1]!, outcome := .survived, elapsedMs := 15 },
+    { mutant := ms[2]!, outcome := .uncovered, elapsedMs := 0 }
+  ]
+  let mutHtmlPath := dir / "mutate.html"
+  writeMutateHtml mutHtmlPath sampleMutRes
+  check "writeMutateHtml created file" (← mutHtmlPath.pathExists)
+  let emptyMutHtml := dir / "mutate_empty.html"
+  writeMutateHtml emptyMutHtml (summarizeMutateResults 0 #[])
+  check "writeMutateHtml empty/0-survivor created file" (← emptyMutHtml.pathExists)
+  let mutHtmlTxt ← IO.FS.readFile mutHtmlPath
+  check "mutate html has outcome filter and badges" (
+    (mutHtmlTxt.splitOn "id=\"mut-out\"").length > 1 &&
+    (mutHtmlTxt.splitOn "survived").length > 1
+  )
+  IO.FS.writeFile (dir / "OptMut.lean") mutSrc
+  IO.FS.writeFile (dir / "lakefile.toml") "name = \"optmut\"\n"
+  let okSh := dir / "ok.sh"
+  IO.FS.writeFile okSh "#!/bin/sh\nexit 0\n"
+  let _ ← IO.Process.output { cmd := "chmod", args := #["+x", okSh.toString] }
+  let cliMutHtml := dir / "cli_mut.html"
+  checkEq "cli mutate --html --kinds const,result" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", dir.toString, "--file", "OptMut.lean",
+    "--kinds", "const,result", "--html", cliMutHtml.toString, "--no-build", "--", okSh.toString
+  ]) 0
+  check "cli mutate wrote html" (← cliMutHtml.pathExists)
+
+  -- 3. `analyzeDeadFunctions` + `formatDeadReport` + `report --dead`
+  let repo := dir / "dead_repo"
+  IO.FS.createDirAll (repo / "Src")
+  let deadSrc := "def orphanDead (x : Nat) : Nat := if x > 0 then x else 0
+
+def deadLeaf (x : Nat) : Nat := if x > 1 then x else 1
+
+def deadRoot (x : Nat) : Nat := deadLeaf x
+
+def gapTarget (x : Nat) : Nat := if x > 2 then x else 2
+
+def coveredCaller (x : Nat) : Nat := if x > 0 then gapTarget x else 0
+"
+  IO.FS.writeFile (repo / "Src" / "Dead.lean") deadSrc
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "init"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "config", "user.email", "ci@example.com"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "config", "user.name", "CI"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "add", "."] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "commit", "-m", "base"] }
+  IO.FS.writeFile (repo / "Src" / "Dead.lean") (deadSrc ++ "\ndef changedFn (x : Nat) : Nat := if x > 9 then 1 else 0\n")
+  let instRes ← instrumentSource env "Dead.lean" (← IO.FS.readFile (repo / "Src" / "Dead.lean")) 0 {}
+  let deadSitesPath := dir / "dead_sites.json"
+  let deadManifest : Manifest := { sites := instRes.sites, functions := instRes.functions }
+  IO.FS.writeFile deadSitesPath (toJson deadManifest).pretty
+  let mut dHits := Array.replicate deadManifest.sites.size (0 : UInt64)
+  if let some covFn := deadManifest.functions.find? (·.name == "coveredCaller") then
+    for sid in covFn.siteIds do dHits := dHits.set! sid 1
+  let deadProf := dir / "dead.cov"
+  writeProfile deadProf dHits
+  let deadRep ← analyzeDeadFunctions deadManifest dHits (repo / "Src")
+  check "deadRep calledByCovered has gapTarget" (deadRep.calledByCovered.any (·.name == "gapTarget"))
+  check "deadRep calledByUncovered has deadLeaf" (deadRep.calledByUncovered.any (·.name == "deadLeaf"))
+  check "deadRep unreferenced has orphanDead" (deadRep.unreferenced.any (·.name == "orphanDead"))
+  let deadTxt := formatDeadReport deadRep 10
+  check "formatDeadReport renders gapTarget & orphanDead" ((deadTxt.splitOn "gapTarget").length > 1 && (deadTxt.splitOn "orphanDead").length > 1)
+  let emptyDead ← analyzeDeadFunctions {} #[] "."
+  check "analyzeDeadFunctions empty manifest" (emptyDead.unreferenced.isEmpty && emptyDead.calledByCovered.isEmpty)
+  let edgeDeadManifest : Manifest := {
+    sites := #[]
+    functions := #[
+      { name := "(instance BEq Foo)", file := "NoFile.lean", line := 0, endLine := 0, lines := 1, cc := 1, cognitive := 0, siteIds := #[0], isInstance := true },
+      { name := "noSiteFn", file := "NoFile.lean", line := 0, endLine := 0, lines := 1, cc := 1, cognitive := 0, siteIds := #[] },
+      { name := "missingSrcFn", file := "NoFile.lean", line := 0, endLine := 0, lines := 1, cc := 1, cognitive := 0, siteIds := #[0] }
+    ]
+  }
+  let _ ← analyzeDeadFunctions edgeDeadManifest #[0] (dir / "missing_src")
+  check "formatDeadReport topN=0" (((formatDeadReport deadRep 0).splitOn "Test gaps").length == 1)
+
+  -- 4. CLI `report --dead` + PR-diff HTML highlighting (`--git-diff HEAD --html`)
+  let diffHtmlDir := dir / "diff_html"
+  checkEq "cli report --dead --git-diff --html" (← LeanCov.CLI.runCLI [
+    "report", "--sites", deadSitesPath.toString, "--profile", deadProf.toString,
+    "--dead", "--src-root", (repo / "Src").toString,
+    "--git-diff", "HEAD", "--repo", repo.toString,
+    "--html", diffHtmlDir.toString, "--top", "10"
+  ]) 0
+  let idxTxt ← IO.FS.readFile (diffHtmlDir / "index.html")
+  check "PR-diff HTML index shows Patch KPI card" ((idxTxt.splitOn "Patch (HEAD)").length > 1)
+  let deadPageTxt ← IO.FS.readFile (diffHtmlDir / "files" / (safeHtmlFileName "Dead.lean"))
+  check "PR-diff HTML source marks ln-diff" ((deadPageTxt.splitOn "ln-diff").length > 1)
+
+  -- 5. `self = true` in `parseProjectConfig`
+  let selfCfg ← needE "parse self package config" id (parseProjectConfig "[[package]]\nname = \"selfpkg\"\npkg = \".\"\nself = true\nsrc_dirs = [\"LeanCov\"]\n")
+  check "parseProjectConfig reads self = true" selfCfg.packages[0]!.isSelf
+
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+
 unsafe def main : IO UInt32 :=
   runMain "leancov-test" do
     runTest "types & binary profiles" testTypesAndProfiles
@@ -2262,6 +2415,7 @@ unsafe def main : IO UInt32 :=
     runTest "v0.3.0 filtering, HTML & CAF CLI" testV030CLI
     runTest "v0.4.0 while-true, instances, kinds & config" testV040Features
     runTest "v0.4.0 leancov test & parallel mutate e2e" testConfigAndTestCLI
+    runTest "v0.5.0 const/result mut, dead graph & PR diff HTML" testV050Features
     runTest "fuzz primitives & mutator" testFuzzPrimitives
     runTest "exact binary runtime counters (ground truth)" testExactRuntimeCounters
     runTest "AST mutation engine & mutate CLI" testMutateEngineAndCLI

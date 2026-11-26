@@ -87,7 +87,7 @@ ln -sf "$(pwd)/.lake/build/bin/leancov" ~/.local/bin/leancov
 export PATH="$(pwd)/.lake/build/bin:$PATH"
 
 # Verify installation
-leancov --version   # prints: leancov 0.4.0
+leancov --version   # prints: leancov 0.5.0
 ```
 
 > **Note on toolchain lookup:** `leancov` walks up from its resolved executable path to find its own `lean-toolchain` and Lean sysroot, so symlinking `.lake/build/bin/leancov` works from any working directory. If you copy the binary out of the checkout, set `LEAN_SYSROOT="$(lean --print-prefix)"`.
@@ -154,7 +154,7 @@ Combine `.cov` shards into one `.cov` file with `leancov merge`:
 leancov merge --out build/merged.cov --profile-dir build/leancov-stage/profiles
 ```
 
-Merge one or more `.cov` profiles, print summary tables, filter by file/declaration/branch-kind (`--file`, `--decl`, `--exclude-kind`), inspect missed site snippets (`--missed-detail`) or execution hotspots (`--hot`), check git diff patch coverage (`--git-diff`), and export HTML (`--html`), JSON, LCOV, or GitHub-flavored Markdown (`--markdown`):
+Merge one or more `.cov` profiles, print summary tables, filter by file/declaration/branch-kind (`--file`, `--decl`, `--exclude-kind`, `--exclude-instances`), inspect missed site snippets (`--missed-detail`), call-graph test gaps on `0%` functions (`--dead`), or execution hotspots (`--hot`), check git diff patch coverage (`--git-diff`, also highlighted in HTML), and export HTML (`--html`), JSON, LCOV, or GitHub-flavored Markdown (`--markdown`):
 
 ```sh
 leancov report \
@@ -234,9 +234,9 @@ leancov test --report --sort cov  # re-aggregate existing .cov profiles without 
 `leancov mutate` parses computational declarations (`def`, `abbrev`, `instance`) with Lean's parser—skipping `theorem`s, `by` tactic proofs, type signatures, `termination_by` clauses, `have` obligations, attributes, pattern binders, and `s!"..."` interpolated strings (opt in with `--include-interp`)—and evaluates semantics-changing mutants inside a clean out-of-tree staged copy:
 
 - **Comparison & equality flips:** `==` <-> `!=`, `<` <-> `≤`, `<=` -> `<`, `>` <-> `≥`, `>=` -> `>`
+- **Boundary constants (`const.boundary`):** `0` <-> `1` inside comparisons
 - **Arithmetic & bitwise flips:** `+` <-> `-`, `*` <-> `/`, `&&&` <-> `|||`, `<<<` <-> `>>>` (disable with `--no-arith`)
-- **Boolean operator flips:** `&&` <-> `||`
-- **Boolean literal flips:** `true` <-> `false` (`Bool.true` <-> `Bool.false`)
+- **Boolean & result flips (`bool.op`, `bool.lit`, `result.flip`):** `&&` <-> `||`, `true` <-> `false`, `some x` -> `none`
 - **Negation mutations:** `!x` -> `x` / `(x)` and `if c then` / `unless c do` -> `!(c)`
 
 ```sh
@@ -245,12 +245,13 @@ leancov mutate \
   --file MyLib/Policy.lean \
   --filter authorize \
   --sites build/leancov-stage/sites.json --profile-dir build/leancov-stage/profiles \
-  --git-diff origin/main --seed 0x77 --jobs 4 --kinds cmp,bool,lit \
+  --git-diff origin/main --seed 0x77 --jobs 4 --kinds cmp,bool,lit,const,result \
   --build-target my-tests --proof-target MyProofs \
   --timeout 30 \
   --min-score 80.0 \
   --json build/mutate.json \
   --markdown build/mutate.md \
+  --html build/mutate.html \
   -- .lake/build/bin/my-tests
 ```
 
@@ -295,7 +296,7 @@ Example GitHub Actions step using the reusable `LeanNative/leancov` composite ac
 
 ```yaml
 - name: LeanCov Coverage & Quality Gates
-  uses: LeanNative/leancov@v0.4.0
+  uses: LeanNative/leancov@v0.5.0
   with:
     config: leancov.toml
     min-cov: "75.0"

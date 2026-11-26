@@ -16,6 +16,7 @@ structure PackageConfig where
   deps : Array String := #[]
   boolOps : Bool := true
   includeCafs : Bool := false
+  isSelf : Bool := false
   deriving Repr, BEq, Inhabited
 
 /-- Configuration for one executable test suite run by `leancov test`. -/
@@ -202,6 +203,7 @@ private def setPkgField (p : PackageConfig) (k v : String) : Except String Packa
   | "deps" => return { p with deps := ← parseTomlStrArray v }
   | "bool_ops" => return { p with boolOps := ← parseTomlBool v }
   | "include_cafs" => return { p with includeCafs := ← parseTomlBool v }
+  | "self" => return { p with isSelf := ← parseTomlBool v }
   | _ => throw s!"unknown [[package]] option '{k}'"
 
 private def setSuiteField (s : SuiteConfig) (k v : String) : Except String SuiteConfig := do

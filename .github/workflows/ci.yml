@@ -45,32 +45,62 @@ jobs:
         run: |
           .lake/build/bin/leancov --version
           .lake/build/bin/leancov-rt-test
-          .lake/build/bin/leancov-test
+          lake test
 
-      - name: Self-coverage dogfood pass
+      - name: Self-coverage dogfood pass (via leancov.toml)
         run: |
-          rm -rf build/self-stage
-          .lake/build/bin/leancov stage \
-            --pkg . \
-            --out build/self-stage \
-            --self \
-            --src-dir LeanCov \
-            --exclude Runtime.lean \
-            --exclude DoSyntax.lean \
-            --exclude Main.lean
-          (cd build/self-stage && lake build leancov leancov-rt-test leancov-fuzz-test leancov-test)
-          .lake/build/bin/leancov run \
-            --sites build/self-stage/sites.json \
-            --profile build/self-stage/self.cov \
-            -- build/self-stage/.lake/build/bin/leancov-rt-test
-          .lake/build/bin/leancov run \
-            --sites build/self-stage/sites.json \
-            --profile build/self-stage/self.cov \
-            --append \
-            -- build/self-stage/.lake/build/bin/leancov-test
-          .lake/build/bin/leancov report \
-            --sites build/self-stage/sites.json \
-            --profile build/self-stage/self.cov \
-            --files --kinds --sort cog --top 10 \
-            --min-cov 85
-          rm -rf build/self-stage
+          .lake/build/bin/leancov test --config leancov.toml --clean
+          rm -rf build/leancov
+
+      - name: Setup smoke project for action.yml
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          rm -rf build/action_smoke
+          mkdir -p build/action_smoke/Demo
+          cp lean-toolchain build/action_smoke/lean-toolchain
+          cat > build/action_smoke/lakefile.toml <<'EOF'
+          name = "smoke"
+          defaultTargets = ["smoke-test"]
+          [[lean_lib]]
+          name = "Demo"
+          [[lean_exe]]
+          name = "smoke-test"
+          root = "Main"
+          EOF
+          cat > build/action_smoke/Demo.lean <<'EOF'
+          import Demo.Core
+          EOF
+          cat > build/action_smoke/Demo/Core.lean <<'EOF'
+          def f (x : Nat) : Nat := if x > 0 then x else 0
+          EOF
+          cat > build/action_smoke/Main.lean <<'EOF'
+          import Demo
+          def main : IO UInt32 := if f 1 == 1 then pure 0 else pure 1
+          EOF
+          cat > build/action_smoke/leancov.toml <<'EOF'
+          [leancov]
+          out = "build/action_smoke/out"
+          min_cov = 40.0
+          [[package]]
+          name = "smoke"
+          pkg = "build/action_smoke"
+          src_dirs = ["Demo"]
+          exclude = ["Main.lean"]
+          [[suite]]
+          name = "smoke-test"
+          package = "smoke"
+          EOF
+
+      - name: Test local composite action.yml
+        if: matrix.os == 'ubuntu-latest'
+        uses: ./
+        with:
+          version: local
+          config: build/action_smoke/leancov.toml
+          upload-html: 'false'
+          step-summary: 'false'
+
+      - name: Cleanup action smoke
+        if: always() && matrix.os == 'ubuntu-latest'
+        run: rm -rf build/action_smoke

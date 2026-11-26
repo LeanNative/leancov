@@ -22,6 +22,8 @@ inductive MutantKind where
   | boolLitFlip
   | negRemove
   | condNegate
+  | constBoundary
+  | resultFlip
   deriving Repr, BEq, Inhabited
 
 def MutantKind.toString : MutantKind → String
@@ -31,6 +33,8 @@ def MutantKind.toString : MutantKind → String
   | .boolLitFlip => "bool.lit"
   | .negRemove => "neg.remove"
   | .condNegate => "cond.negate"
+  | .constBoundary => "const.boundary"
+  | .resultFlip => "result.flip"
 
 def MutantKind.ofString? : String → Option MutantKind
   | "cmp.flip" => some .cmpFlip
@@ -39,6 +43,8 @@ def MutantKind.ofString? : String → Option MutantKind
   | "bool.lit" => some .boolLitFlip
   | "neg.remove" => some .negRemove
   | "cond.negate" => some .condNegate
+  | "const.boundary" => some .constBoundary
+  | "result.flip" => some .resultFlip
   | _ => none
 
 def MutantKind.ofAlias? : String → Option MutantKind
@@ -48,6 +54,8 @@ def MutantKind.ofAlias? : String → Option MutantKind
   | "lit" => some .boolLitFlip
   | "neg" => some .negRemove
   | "cond" => some .condNegate
+  | "const" => some .constBoundary
+  | "result" => some .resultFlip
   | s => MutantKind.ofString? s
 
 instance : ToJson MutantKind := ⟨fun k => Json.str k.toString⟩
@@ -235,6 +243,27 @@ private def emitNegRemove (stx inner : Syntax) : MutM Unit := do
       else s!"({innerTxt})"
     recordMutant a b .negRemove (compactDisp origTxt) (compactDisp repTxt) repTxt
 
+private def emitConstBoundary (e : Syntax) : MutM Unit := do
+  let u := unwrapParen e
+  if u.getKind == `num then
+    let s ← get
+    if let (some a, some b) := (u.getPos?, u.getTailPos?) then
+      let txt := sliceBytes s a b
+      if txt == "0" then
+        recordMutant a b .constBoundary "0" "1" "1"
+      else if txt == "1" then
+        recordMutant a b .constBoundary "1" "0" "0"
+
+private def emitResultFlip (stx : Syntax) (fn : Syntax) : MutM Unit := do
+  match unwrapParen fn with
+  | .ident _ _ n _ =>
+    if n == `some || n == `Option.some then
+      let s ← get
+      if let (some a, some b) := (stx.getPos?, stx.getTailPos?) then
+        let orig := compactDisp (sliceBytes s a b)
+        recordMutant a b .resultFlip orig "none" "none"
+  | _ => pure ()
+
 private def redundantOrPropCondKinds : Array SyntaxNodeKind := #[
   `term!_, `«term_==_», `«term_!=_»,
   `«term_=_», `«term_≠_», `«term_¬_», `«term_∧_», `«term_∨_», `«term_∈_», `«term_∉_»
@@ -324,6 +353,8 @@ private partial def walkMutDoPatDecl (args : Array Syntax) : MutM Unit := do
 private partial def walkMutOp? (stx : Syntax) (k : SyntaxNodeKind) (args : Array Syntax) : MutM Bool := do
   if isCmpKind k && args.size ≥ 3 then
     emitInfixFlip args[1]! .cmpFlip cmpFlip?
+    emitConstBoundary args[0]!
+    emitConstBoundary args[2]!
     walkMutExpr args[0]!; walkMutExpr args[2]!
     return true
   if isArithKind k && args.size ≥ 3 then
@@ -372,6 +403,9 @@ private partial def walkMutNode (stx : Syntax) (k : SyntaxNodeKind) (args : Arra
   if ← walkMutOp? stx k args then return
   if ← walkMutIfOrUnless? k args then return
   match k with
+  | `Lean.Parser.Term.app =>
+    if args.size ≥ 2 then emitResultFlip stx args[0]!
+    for a in args do walkMutExpr a
   | `Lean.Parser.Term.typeAscription => walkMutAt args 1
   | `Lean.Parser.Term.proj => walkMutAt args 0
   | `Lean.Parser.Term.matchAlt => walkMutAt args 3

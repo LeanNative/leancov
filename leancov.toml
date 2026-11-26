@@ -1,0 +1,33 @@
+[leancov]
+out = "build/leancov"
+jobs = 2
+sort = "cog"
+top = 15
+files = true
+kinds = true
+min_cov = 85.0
+max_crap = 100.0
+max_cog_crap = 100.0
+
+[[package]]
+name = "leancov"
+pkg = "."
+self = true
+src_dirs = ["LeanCov"]
+exclude = ["Runtime.lean", "DoSyntax.lean", "Main.lean"]
+
+[[suite]]
+name = "leancov-rt-test"
+package = "leancov"
+fast = true
+
+[[suite]]
+name = "leancov-fuzz-test"
+package = "leancov"
+args = ["--target", "clean", "--iterations", "10"]
+fast = true
+
+[[suite]]
+name = "leancov-test"
+package = "leancov"
+fast = true

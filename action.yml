@@ -3,9 +3,9 @@ description: "Install LeanCov and run source-level Lean 4 coverage, complexity, 
 
 inputs:
   version:
-    description: "LeanCov release tag (e.g. v0.4.0)"
+    description: "LeanCov release tag (e.g. v0.5.0, or 'local' to build action_path)"
     required: false
-    default: "v0.4.0"
+    default: "v0.5.0"
   config:
     description: "Path to leancov.toml configuration file"
     required: false
@@ -74,7 +74,11 @@ runs:
         rm -rf "$INSTALL_DIR"
         mkdir -p "$INSTALL_DIR"
         URL="https://github.com/LeanNative/leancov/releases/download/${{ inputs.version }}/leancov-${{ inputs.version }}-${TARGET}.tar.gz"
-        if curl -fsSL "$URL" -o "${RUNNER_TEMP}/leancov.tar.gz"; then
+        if [ "${{ inputs.version }}" = "local" ]; then
+          LEANCOV_ROOT="${{ github.action_path }}"
+          (cd "$LEANCOV_ROOT" && lake build leancov)
+          BIN="$LEANCOV_ROOT/.lake/build/bin/leancov"
+        elif curl -fsSL "$URL" -o "${RUNNER_TEMP}/leancov.tar.gz"; then
           tar -xzf "${RUNNER_TEMP}/leancov.tar.gz" -C "$INSTALL_DIR"
           rm -f "${RUNNER_TEMP}/leancov.tar.gz"
           LEANCOV_ROOT="$INSTALL_DIR/leancov"

@@ -138,7 +138,7 @@ private def uniqueSortedNat (xs : Array Nat) : Array Nat := Id.run do
       out := out.push x
   return out
 
-private def pathMatchesSuffix (a b : String) : Bool :=
+def pathMatchesSuffix (a b : String) : Bool :=
   a == b || a.endsWith ("/" ++ b) || b.endsWith ("/" ++ a)
 
 private def parseHunkPlusRange? (line : String) : Option (Nat × Nat) := do
@@ -793,6 +793,99 @@ def formatStaticAnalysis (m : Manifest) (topN : Nat := 30) (sortByCog : Bool := 
     for i in [:shown] do
       let f := sorted[i]!
       out := out.push s!"  {padLeft 4 (toString f.cognitive)} {padLeft 4 (toString f.cc)} {padLeft 6 (toString f.siteIds.size)} {padLeft 5 (toString f.lines)}  {f.name} ({f.file}:{f.line})"
+  return "\n".intercalate out.toList
+
+/-- Call-graph classification of a 0%-covered declaration. -/
+inductive DeadCategory where
+  | unreferenced
+  | calledByCovered
+  | calledByUncovered
+  deriving Repr, BEq, Inhabited
+
+/-- Details for a 0%-covered declaration categorized by static call-site references. -/
+structure DeadFuncEntry where
+  name : String
+  file : String
+  line : Nat
+  sitesTotal : Nat
+  category : DeadCategory
+  callers : Array String := #[]
+  deriving Repr, BEq, Inhabited
+
+/-- Call-graph gap analysis across all 0%-covered declarations in a manifest. -/
+structure DeadReport where
+  unreferenced : Array DeadFuncEntry := #[]
+  calledByCovered : Array DeadFuncEntry := #[]
+  calledByUncovered : Array DeadFuncEntry := #[]
+  deriving Repr, BEq, Inhabited
+
+private def extractIdentTokens (text : String) : Std.HashMap String Bool := Id.run do
+  let mut out : Std.HashMap String Bool := {}
+  let mut cur := ""
+  for c in text.toList do
+    if c.isAlphanum || c == '_' || c == '\'' then
+      cur := cur.push c
+    else if !cur.isEmpty then
+      out := out.insert cur true
+      cur := ""
+  if !cur.isEmpty then out := out.insert cur true
+  return out
+
+/-- Classify 0%-covered declarations into `calledByCovered` (test gaps), `calledByUncovered`, and `unreferenced`. -/
+def analyzeDeadFunctions (m : Manifest) (hits : Array UInt64) (srcRoot : System.FilePath) : IO DeadReport := do
+  let mut fileCache : Std.HashMap String (Array String) := {}
+  for f in m.functions do
+    unless fileCache.contains f.file do
+      let ls ← try
+        let raw ← IO.FS.readFile (srcRoot / f.file)
+        pure (raw.splitOn "\n").toArray
+      catch _ => pure #[]
+      fileCache := fileCache.insert f.file ls
+  let isCovered (f : FuncInfo) : Bool :=
+    f.siteIds.any fun sid => hitAt hits sid > 0
+  let mut bodyTokens : Array (FuncInfo × Bool × Std.HashMap String Bool) := Array.mkEmpty m.functions.size
+  for f in m.functions do
+    let lines := fileCache.getD f.file #[]
+    let lo := if f.line > 0 then f.line - 1 else 0
+    let hi := min f.endLine lines.size
+    let slice := if lo < hi then "\n".intercalate ((lines.extract lo hi).toList) else ""
+    bodyTokens := bodyTokens.push (f, isCovered f, extractIdentTokens slice)
+  let mut unref : Array DeadFuncEntry := #[]
+  let mut byCov : Array DeadFuncEntry := #[]
+  let mut byUncov : Array DeadFuncEntry := #[]
+  for f in m.functions do
+    if f.siteIds.isEmpty || isCovered f || f.name.startsWith "(" then continue
+    let shortName := (f.name.splitOn ".").getLast?.getD f.name
+    if shortName.isEmpty then continue
+    let mut covCallers : Array String := #[]
+    let mut uncovCallers : Array String := #[]
+    for (caller, cov, toks) in bodyTokens do
+      if caller.name != f.name && toks.contains shortName then
+        if cov then covCallers := covCallers.push caller.name
+        else uncovCallers := uncovCallers.push caller.name
+    if !covCallers.isEmpty then
+      byCov := byCov.push { name := f.name, file := f.file, line := f.line, sitesTotal := f.siteIds.size, category := .calledByCovered, callers := covCallers.take 4 }
+    else if !uncovCallers.isEmpty then
+      byUncov := byUncov.push { name := f.name, file := f.file, line := f.line, sitesTotal := f.siteIds.size, category := .calledByUncovered, callers := uncovCallers.take 4 }
+    else
+      unref := unref.push { name := f.name, file := f.file, line := f.line, sitesTotal := f.siteIds.size, category := .unreferenced }
+  return { unreferenced := unref, calledByCovered := byCov, calledByUncovered := byUncov }
+
+/-- Format `DeadReport` for terminal inspection. -/
+def formatDeadReport (d : DeadReport) (topN : Nat := 20) : String := Id.run do
+  let mut out : Array String := #[]
+  out := out.push "=== LeanCov Call-Graph Gap Analysis (0% functions) ==="
+  out := out.push s!"Called by covered (test gaps): {d.calledByCovered.size} | Called only by uncovered: {d.calledByUncovered.size} | Unreferenced: {d.unreferenced.size}"
+  if topN > 0 && !d.calledByCovered.isEmpty then
+    out := out.push ""
+    out := out.push "Test gaps (0% target called from covered code):"
+    for e in d.calledByCovered.take topN do
+      out := out.push s!"  {e.name} ({e.file}:{e.line}, {e.sitesTotal} sites) <- {", ".intercalate e.callers.toList}"
+  if topN > 0 && !d.unreferenced.isEmpty then
+    out := out.push ""
+    out := out.push "Unreferenced 0% declarations:"
+    for e in d.unreferenced.take topN do
+      out := out.push s!"  {e.name} ({e.file}:{e.line}, {e.sitesTotal} sites)"
   return "\n".intercalate out.toList
 
 end LeanCov.Cov

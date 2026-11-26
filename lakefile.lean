@@ -2,7 +2,11 @@ import Lake
 open Lake DSL
 
 package «leancov» where
-  version := v!"0.4.0"
+  version := v!"0.5.0"
+  description := "Source-level branch & line coverage, McCabe/Cognitive CRAP, AST mutation testing, and greybox fuzzing for Lean 4"
+  keywords := #["coverage", "testing", "mutation-testing", "fuzzing", "crap", "lcov"]
+  homepage := "https://github.com/LeanNative/leancov"
+  license := "MIT"
 
 target leancov_rt.o pkg : System.FilePath := do
   let oFile := pkg.buildDir / "c" / "leancov_rt.o"
@@ -38,6 +42,7 @@ lean_exe «leancov-fuzz-test» where
   srcDir := "."
   root := `Tests.FuzzTest
 
+@[test_driver]
 lean_exe «leancov-test» where
   srcDir := "."
   root := `Tests.SelfTest

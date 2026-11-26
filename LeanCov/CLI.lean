@@ -21,7 +21,7 @@ namespace LeanCov.CLI
 open Lean LeanCov.Cov
 
 /-- Package version printed by `leancov --version` / `-V`. -/
-def version : String := "0.4.0"
+def version : String := "0.5.0"
 
 private def usage : String :=
 "leancov — source-level Lean 4 coverage, McCabe CRAP, Cognitive Complexity, and AST Mutation Testing
@@ -39,7 +39,7 @@ Usage:
                      [--json <out.json>] [--lcov <out.info>] [--markdown <out.md>] [--html <dir>] [--top <N>]
                      [--sort crap|cog|cc|uncov|cov] [--file <substr>]... [--decl <substr>]...
                      [--exclude-kind <kind>]... [--exclude-instances] [--files] [--kinds] [--missed]
-                     [--missed-detail] [--src-root <dir>] [--hot]
+                     [--missed-detail] [--dead] [--src-root <dir>] [--hot]
                      [--git-diff <baseRef>] [--repo <dir>] [--min-patch-cov <pct>]
                      [--min-cov <pct>] [--max-crap <val>] [--max-cog-crap <val>]
   leancov test       [--config <leancov.toml>] [--leancov <leancovDir>] [--fast] [--clean]
@@ -53,12 +53,12 @@ Usage:
   leancov analyze    --src <dir> [--src ...] [--exclude <substr>]... [--imports <Mod1,Mod2>]...
                      [--json <out.json>] [--top <N>] [--sort cog|cc]
   leancov mutate     --pkg <pkgDir> [--out <workDir>] (--file <relFile> | --src-dir <relDir>)...
-                     [--filter <declSubstr>]... [--kinds <k1,k2>]... [--jobs <N>]
-                     [--max-mutants <N>] [--seed <N>] [--timeout <sec>]
+                     [--filter <declSubstr>]... [--kinds <cmp,arith,bool,lit,neg,cond,const,result>]...
+                     [--jobs <N>] [--max-mutants <N>] [--seed <N>] [--timeout <sec>]
                      [--build-target <lakeTarget>]... [--proof-target <lakeTarget>]... [--no-build]
                      [--sites <sites.json> (--profile <p.cov> | --profile-dir <dir>)...]
                      [--git-diff <baseRef>] [--no-arith] [--include-interp] [--imports <Mod1,Mod2>]...
-                     [--json <out.json>] [--markdown <out.md>] [--min-score <pct>] [--keep-work] -- <testCmd> [args...]
+                     [--json <out.json>] [--markdown <out.md>] [--html <out.html>] [--min-score <pct>] [--keep-work] -- <testCmd> [args...]
   leancov --version | -V
   leancov --help | -h
 "
@@ -524,7 +524,7 @@ private def runtimeOnlyLakefile : String :=
 open Lake DSL
 
 package «leancov» where
-  version := v!\"0.4.0\"
+  version := v!\"0.5.0\"
 
 target leancov_rt.o pkg : System.FilePath := do
   let oFile := pkg.buildDir / \"c\" / \"leancov_rt.o\"
@@ -734,6 +734,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
   let mut showKinds : Bool := false
   let mut showMissed : Bool := false
   let mut showMissedDetail : Bool := false
+  let mut showDead : Bool := false
   let mut showHot : Bool := false
   let mut srcRoot : System.FilePath := "."
   let mut gitDiffRef : Option String := none
@@ -774,6 +775,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
     | "--kinds" :: tl => showKinds := true; rest := tl
     | "--missed" :: tl => showMissed := true; rest := tl
     | "--missed-detail" :: tl => showMissedDetail := true; rest := tl
+    | "--dead" :: tl => showDead := true; rest := tl
     | "--src-root" :: v :: tl => srcRoot := ⟨v⟩; rest := tl
     | "--hot" :: tl => showHot := true; rest := tl
     | "--git-diff" :: v :: tl => gitDiffRef := some v; rest := tl
@@ -820,16 +822,20 @@ private def cmdReport (args : List String) : IO UInt32 := do
       IO.println ("\n" ++ det)
   if showHot then
     IO.println ("\n" ++ formatHotSites mEff hits (if topN == 0 then 20 else topN))
+  if showDead then
+    let deadRep ← analyzeDeadFunctions mEff hits srcRoot
+    IO.println ("\n" ++ formatDeadReport deadRep (if topN == 0 then 20 else topN))
 
-  let patchOpt? : Option PatchReport ← match gitDiffRef with
-    | none => pure none
+  let diffRes ← match gitDiffRef with
+    | none => pure (none, none)
     | some ref =>
       match ← collectGitChangedLines repoDir ref with
       | .error e => IO.eprintln s!"report: {e}"; return 2
       | .ok changed =>
         let pr := buildPatchReport mEff hits ref changed
         IO.println ("\n" ++ formatPatchReport pr)
-        pure (some pr)
+        pure (some changed, some pr)
+  let (changedOpt?, patchOpt?) := diffRes
 
   if let some jp := jsonOut then
     if let some p := jp.parent then IO.FS.createDirAll p
@@ -841,7 +847,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
     if let some p := mp.parent then IO.FS.createDirAll p
     IO.FS.writeFile mp (formatReportMarkdown rep topN sortBy patchOpt?)
   if let some hd := htmlOut then
-    writeHtmlReport hd srcRoot mEff hits rep
+    writeHtmlReport hd srcRoot mEff hits rep changedOpt? patchOpt?
 
   let mut failed := false
   if let some mc := minCov then
@@ -998,6 +1004,7 @@ private structure MutateOpts where
   extraImports : Array Name := #[]
   jsonOut : Option System.FilePath := none
   mdOut : Option System.FilePath := none
+  htmlOut : Option System.FilePath := none
   minScore : Option Float := none
   keepWork : Bool := false
   cmdArgs : List String := []
@@ -1066,6 +1073,7 @@ private def parseMutateArgs : List String → MutateOpts → IO (Except String M
   | "--imports" :: v :: tl, o => parseMutateArgs tl { o with extraImports := o.extraImports ++ splitImports v }
   | "--json" :: v :: tl, o => parseMutateArgs tl { o with jsonOut := some ⟨v⟩ }
   | "--markdown" :: v :: tl, o => parseMutateArgs tl { o with mdOut := some ⟨v⟩ }
+  | "--html" :: v :: tl, o => parseMutateArgs tl { o with htmlOut := some ⟨v⟩ }
   | "--min-score" :: v :: tl, o =>
     match parseFloat? v with
     | some f => parseMutateArgs tl { o with minScore := some f }
@@ -1260,6 +1268,8 @@ private unsafe def cmdMutate (args : List String) : IO UInt32 := do
   if let some mp := opts.mdOut then
     if let some p := mp.parent then IO.FS.createDirAll p
     IO.FS.writeFile mp (formatMutateMarkdown rep)
+  if let some hp := opts.htmlOut then
+    writeMutateHtml hp rep
   if let some ms := opts.minScore then
     if rep.score < ms then
       IO.eprintln s!"FAIL: mutation score {rep.score}% < --min-score {ms}%"
@@ -1369,119 +1379,102 @@ private def runSuiteWorker (outDir rootDir : System.FilePath) (cfg : ProjectConf
     out := out.push (s.name, proc.exitCode)
   return out
 
-/-- Run `leancov test`: declarative multi-package staging, parallel execution, and reporting from `leancov.toml`. -/
-private unsafe def cmdTest (args : List String) : IO UInt32 := do
-  let opts ← match parseTestArgs args {} with
-    | .ok o => pure o
-    | .error e => IO.eprintln e; return 2
-  unless ← opts.configPath.pathExists do
-    IO.eprintln s!"test: config file not found: {opts.configPath}"
-    return 2
-  let cfg ← match parseProjectConfig (← IO.FS.readFile opts.configPath) with
-    | .ok c => pure c
-    | .error e => IO.eprintln s!"test: {opts.configPath}: {e}"; return 2
-  if opts.listOnly then
-    for s in cfg.suites do
-      let tier := if s.fast then "fast" else "full"
-      IO.println s!"  {s.name}  ({s.package}:{s.target}, {tier})"
-    return 0
-  let mut selected : Array SuiteConfig := #[]
-  if !opts.suites.isEmpty then
-    for nm in opts.suites do
-      match cfg.suites.find? (·.name == nm) with
-      | some s => selected := selected.push s
-      | none => IO.eprintln s!"test: unknown suite '{nm}'"; return 2
-  else
-    selected := if opts.fastMode then cfg.suites.filter (·.fast) else cfg.suites
-  if selected.isEmpty then
-    IO.eprintln "test: no suites selected to run"
-    return 2
+private def selectTestSuites (cfg : ProjectConfig) (opts : TestOpts) : Except String (Array SuiteConfig) := do
+  let selected ←
+    if opts.suites.isEmpty then
+      .ok (if opts.fastMode then cfg.suites.filter (·.fast) else cfg.suites)
+    else
+      opts.suites.mapM fun nm =>
+        match cfg.suites.find? (·.name == nm) with
+        | some s => .ok s
+        | none => .error s!"test: unknown suite '{nm}'"
+  if selected.isEmpty then throw "test: no suites selected to run"
+  return selected
 
-  let cfgAbs ← canonicalOrAbs opts.configPath
-  let rootDir := cfgAbs.parent.getD ⟨"."⟩
-  let outDir := resolveFromRoot rootDir cfg.out
-  let sitesPath := outDir / "sites.json"
+private unsafe def stageOneTestPkg (cfg : ProjectConfig) (rootDir outDir sitesPath : System.FilePath)
+    (leancovDir : Option System.FilePath) (idx : Nat) (p : PackageConfig) : IO UInt32 := do
+  let mut stArgs : List String := [
+    "--pkg", (resolveFromRoot rootDir p.pkg).toString,
+    "--out", (outDir / p.name).toString,
+    "--sites", sitesPath.toString
+  ]
+  if let some ld := leancovDir then stArgs := stArgs ++ ["--leancov", ld.toString]
+  if idx > 0 then stArgs := stArgs ++ ["--append-sites"]
+  if !p.pathPrefix.isEmpty then stArgs := stArgs ++ ["--prefix", p.pathPrefix]
+  for sd in p.srcDirs do stArgs := stArgs ++ ["--src-dir", sd]
+  for ex in p.exclude do stArgs := stArgs ++ ["--exclude", ex]
+  for imp in p.imports do stArgs := stArgs ++ ["--imports", imp]
+  for d in p.deps do
+    let depVal := match d.splitOn "=" with
+      | [dn, dv] =>
+        if cfg.packages.any (·.name == dv) then s!"{dn}={outDir / dv}"
+        else s!"{dn}={resolveFromRoot rootDir dv}"
+      | _ => d
+    stArgs := stArgs ++ ["--dep", depVal]
+  if !p.boolOps then stArgs := stArgs ++ ["--no-bool-ops"]
+  if p.includeCafs then stArgs := stArgs ++ ["--include-cafs"]
+  if p.isSelf then stArgs := stArgs ++ ["--self"]
+  cmdStage stArgs
+
+private def buildTestTargets (cfg : ProjectConfig) (outDir : System.FilePath)
+    (selected : Array SuiteConfig) : IO UInt32 := do
+  for p in cfg.packages do
+    let mut targets : Array String := #[]
+    for s in selected do
+      if s.package == p.name && !targets.contains s.target then
+        targets := targets.push s.target
+    if !targets.isEmpty then
+      IO.println s!"Building {p.name} target(s): {", ".intercalate targets.toList}"
+      let bOut ← IO.Process.output { cmd := "lake", args := #["build"] ++ targets, cwd := some (outDir / p.name) }
+      if bOut.exitCode != 0 then
+        IO.eprintln s!"test: lake build failed in {outDir / p.name}:\n{bOut.stdout}{bOut.stderr}"
+        return 1
+  return 0
+
+private unsafe def runTestSuites (cfg : ProjectConfig) (opts : TestOpts)
+    (rootDir outDir sitesPath : System.FilePath) (selected : Array SuiteConfig) :
+    IO (Except UInt32 (Array String)) := do
   let profilesDir := outDir / "profiles"
   let logsDir := outDir / "logs"
-
-  let mut failedSuites : Array String := #[]
-  unless opts.reportOnly do
-    if opts.cleanMode then
-      let _ ← IO.Process.output { cmd := "rm", args := #["-rf", outDir.toString] }
-    unless opts.noBuild do
-      if ← sitesPath.pathExists then
-        let _ ← IO.Process.output { cmd := "rm", args := #["-f", sitesPath.toString] }
-      for idx in [:cfg.packages.size] do
-        let p := cfg.packages[idx]!
-        let mut stArgs : List String := [
-          "--pkg", (resolveFromRoot rootDir p.pkg).toString,
-          "--out", (outDir / p.name).toString,
-          "--sites", sitesPath.toString
-        ]
-        if let some ld := opts.leancovDir then stArgs := stArgs ++ ["--leancov", ld.toString]
-        if idx > 0 then stArgs := stArgs ++ ["--append-sites"]
-        if !p.pathPrefix.isEmpty then stArgs := stArgs ++ ["--prefix", p.pathPrefix]
-        for sd in p.srcDirs do stArgs := stArgs ++ ["--src-dir", sd]
-        for ex in p.exclude do stArgs := stArgs ++ ["--exclude", ex]
-        for imp in p.imports do stArgs := stArgs ++ ["--imports", imp]
-        for d in p.deps do
-          let depVal := match d.splitOn "=" with
-            | [dn, dv] =>
-              if cfg.packages.any (·.name == dv) then s!"{dn}={outDir / dv}"
-              else s!"{dn}={resolveFromRoot rootDir dv}"
-            | _ => d
-          stArgs := stArgs ++ ["--dep", depVal]
-        if !p.boolOps then stArgs := stArgs ++ ["--no-bool-ops"]
-        if p.includeCafs then stArgs := stArgs ++ ["--include-cafs"]
-        let stCode ← cmdStage stArgs
-        if stCode != 0 then return stCode
-      for p in cfg.packages do
-        let mut targets : Array String := #[]
-        for s in selected do
-          if s.package == p.name && !targets.contains s.target then
-            targets := targets.push s.target
-        if !targets.isEmpty then
-          IO.println s!"Building {p.name} target(s): {", ".intercalate targets.toList}"
-          let bOut ← IO.Process.output {
-            cmd := "lake"
-            args := #["build"] ++ targets
-            cwd := some (outDir / p.name)
-          }
-          if bOut.exitCode != 0 then
-            IO.eprintln s!"test: lake build failed in {outDir / p.name}:\n{bOut.stdout}{bOut.stderr}"
-            return 1
-    unless ← sitesPath.pathExists do
-      IO.eprintln s!"test: {sitesPath} not found; run without --no-build first"
-      return 2
-    let m ← readManifest sitesPath
-    if opts.suites.isEmpty && !opts.fastMode then
-      let _ ← IO.Process.output { cmd := "rm", args := #["-rf", profilesDir.toString, logsDir.toString] }
-    IO.FS.createDirAll profilesDir
-    IO.FS.createDirAll logsDir
-    let jobs := max 1 (opts.jobs?.getD cfg.jobs)
-    let nWorkers := min jobs selected.size
-    IO.println s!"Running {selected.size} suite(s) with {nWorkers} worker(s)..."
-    LeanCov.raiseStack ()
-    let queueRef ← Std.Mutex.new selected.toList
-    let printMutex ← Std.Mutex.new ()
-    let mut tasks : Array (Task (Except IO.Error (Array (String × UInt32)))) := #[]
-    for _ in [:nWorkers] do
-      let t ← IO.asTask (prio := .dedicated) (runSuiteWorker outDir rootDir cfg m.armOnMain m.sites.size queueRef printMutex)
-      tasks := tasks.push t
-    for t in tasks do
-      let res ← IO.ofExcept (← IO.wait t)
-      for (sn, code) in res do
-        if code != 0 then failedSuites := failedSuites.push sn
-
+  if opts.cleanMode then
+    let _ ← IO.Process.output { cmd := "rm", args := #["-rf", outDir.toString] }
+  unless opts.noBuild do
+    if ← sitesPath.pathExists then
+      let _ ← IO.Process.output { cmd := "rm", args := #["-f", sitesPath.toString] }
+    for idx in [:cfg.packages.size] do
+      let code ← stageOneTestPkg cfg rootDir outDir sitesPath opts.leancovDir idx cfg.packages[idx]!
+      if code != 0 then return .error code
+    let bCode ← buildTestTargets cfg outDir selected
+    if bCode != 0 then return .error bCode
   unless ← sitesPath.pathExists do
-    IO.eprintln s!"test: {sitesPath} not found; run suites first"
-    return 2
+    IO.eprintln s!"test: {sitesPath} not found; run without --no-build first"
+    return .error 2
+  let m ← readManifest sitesPath
+  if opts.suites.isEmpty && !opts.fastMode then
+    let _ ← IO.Process.output { cmd := "rm", args := #["-rf", profilesDir.toString, logsDir.toString] }
+  IO.FS.createDirAll profilesDir
+  IO.FS.createDirAll logsDir
+  let nWorkers := min (max 1 (opts.jobs?.getD cfg.jobs)) selected.size
+  IO.println s!"Running {selected.size} suite(s) with {nWorkers} worker(s)..."
+  LeanCov.raiseStack ()
+  let queueRef ← Std.Mutex.new selected.toList
+  let printMutex ← Std.Mutex.new ()
+  let mut tasks : Array (Task (Except IO.Error (Array (String × UInt32)))) := #[]
+  for _ in [:nWorkers] do
+    tasks := tasks.push (← IO.asTask (prio := .dedicated) (runSuiteWorker outDir rootDir cfg m.armOnMain m.sites.size queueRef printMutex))
+  let mut failedSuites : Array String := #[]
+  for t in tasks do
+    for (sn, code) in (← IO.ofExcept (← IO.wait t)) do
+      if code != 0 then failedSuites := failedSuites.push sn
+  return .ok failedSuites
 
+private def buildTestReportArgs (cfg : ProjectConfig) (opts : TestOpts)
+    (rootDir outDir sitesPath : System.FilePath) (selected : Array SuiteConfig) : List String := Id.run do
+  let profilesDir := outDir / "profiles"
   let subsetReport := opts.reportOnly && (!opts.suites.isEmpty || opts.fastMode)
   let mut repArgs : List String := ["--sites", sitesPath.toString]
   if subsetReport then
-    for s in selected do
-      repArgs := repArgs ++ ["--profile", (profilesDir / s!"{s.name}.cov").toString]
+    for s in selected do repArgs := repArgs ++ ["--profile", (profilesDir / s!"{s.name}.cov").toString]
   else
     repArgs := repArgs ++ ["--profile-dir", profilesDir.toString]
   repArgs := repArgs ++ [
@@ -1502,9 +1495,37 @@ private unsafe def cmdTest (args : List String) : IO UInt32 := do
   if let some mc := opts.minCov?.orElse (fun _ => cfg.minCov) then repArgs := repArgs ++ ["--min-cov", toString mc]
   if let some xc := opts.maxCrap?.orElse (fun _ => cfg.maxCrap) then repArgs := repArgs ++ ["--max-crap", toString xc]
   if let some xg := opts.maxCogCrap?.orElse (fun _ => cfg.maxCogCrap) then repArgs := repArgs ++ ["--max-cog-crap", toString xg]
-  let repCode ← cmdReport repArgs
+  return repArgs
+
+/-- Run `leancov test`: declarative multi-package staging, parallel execution, and reporting from `leancov.toml`. -/
+private unsafe def cmdTest (args : List String) : IO UInt32 := do
+  let opts ← match parseTestArgs args {} with
+    | .ok o => pure o
+    | .error e => IO.eprintln e; return 2
+  unless ← opts.configPath.pathExists do
+    IO.eprintln s!"test: config file not found: {opts.configPath}"; return 2
+  let cfg ← match parseProjectConfig (← IO.FS.readFile opts.configPath) with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"test: {opts.configPath}: {e}"; return 2
+  if opts.listOnly then
+    for s in cfg.suites do
+      IO.println s!"  {s.name}  ({s.package}:{s.target}, {if s.fast then "fast" else "full"})"
+    return 0
+  let selected ← match selectTestSuites cfg opts with
+    | .ok ss => pure ss
+    | .error e => IO.eprintln e; return 2
+  let rootDir := (← canonicalOrAbs opts.configPath).parent.getD ⟨"."⟩
+  let outDir := resolveFromRoot rootDir cfg.out
+  let sitesPath := outDir / "sites.json"
+  let failedSuites ← if opts.reportOnly then pure #[] else
+    match ← runTestSuites cfg opts rootDir outDir sitesPath selected with
+    | .ok fs => pure fs
+    | .error code => return code
+  unless ← sitesPath.pathExists do
+    IO.eprintln s!"test: {sitesPath} not found; run suites first"; return 2
+  let repCode ← cmdReport (buildTestReportArgs cfg opts rootDir outDir sitesPath selected)
   if !failedSuites.isEmpty then
-    IO.eprintln s!"test: failed suite(s): {", ".intercalate failedSuites.toList} (logs in {logsDir})"
+    IO.eprintln s!"test: failed suite(s): {", ".intercalate failedSuites.toList} (logs in {outDir / "logs"})"
     return 1
   return repCode
 

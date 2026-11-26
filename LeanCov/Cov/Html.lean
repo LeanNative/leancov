@@ -1,6 +1,7 @@
 import Std.Data.HashMap
 import LeanCov.Cov.Types
 import LeanCov.Cov.Report
+import LeanCov.Cov.Mutate
 
 /-! # Standalone HTML Coverage Report Generator -/
 
@@ -58,8 +59,11 @@ th.num, td.num { text-align:right; font-variant-numeric:tabular-nums; }
 .src td.hits { color:var(--muted); text-align:right; width:64px; user-select:none; border-right:1px solid var(--border); }
 .src td.code pre { margin:0; white-space:pre-wrap; word-break:break-word; display:inline; }
 .ln-hit { background:var(--hitbg); } .ln-part { background:var(--partbg); } .ln-miss { background:var(--missbg); }
+.ln-diff td.lnum { border-left:3px solid var(--link); }
 .badge { display:inline-block; margin-left:6px; padding:0 5px; border-radius:4px; font-size:11px; border:1px solid var(--border); }
-.b-hit { color:var(--ok); } .b-miss { color:var(--bad); font-weight:600; }
+.b-hit { color:var(--ok); } .b-miss { color:var(--bad); font-weight:600; } .b-diff { color:var(--link); }
+.controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:8px 0 12px; }
+select { padding:7px 10px; border:1px solid var(--border); border-radius:6px; background:var(--card); color:var(--fg); }
 .fn-list { display:flex; flex-wrap:wrap; gap:6px; margin:10px 0 16px; }
 .fn-pill { background:var(--card); border:1px solid var(--border); border-radius:999px; padding:2px 9px; font-size:12px; }
 "
@@ -100,7 +104,7 @@ private def indexSortFilterJs : String :=
 private def renderHtmlDoc (title body : String) : String :=
   s!"<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>{htmlEscape title}</title><style>{htmlCss}</style></head>\n<body>\n{body}\n</body></html>\n"
 
-private def renderIndexHtml (r : SummaryReport) : String := Id.run do
+private def renderIndexHtml (r : SummaryReport) (patch? : Option PatchReport := none) : String := Id.run do
   let fnCov := if r.functionsTotal == 0 then 1.0 else Float.ofNat r.functionsHit / Float.ofNat r.functionsTotal
   let mut parts : Array String := #[]
   parts := parts.push "<h1>LeanCov Coverage Report</h1>"
@@ -110,6 +114,9 @@ private def renderIndexHtml (r : SummaryReport) : String := Id.run do
   parts := parts.push s!"<div class=\"card\"><div class=\"lbl\">Functions</div><div class=\"val {htmlCovClass fnCov}\">{htmlPct fnCov}</div><div>{r.functionsHit}/{r.functionsTotal}</div></div>"
   parts := parts.push s!"<div class=\"card\"><div class=\"lbl\">Max CRAP</div><div class=\"val\">{htmlScore r.maxCrap}</div><div>avg {htmlScore r.avgCrap} (&gt;30: {r.crapOver30})</div></div>"
   parts := parts.push s!"<div class=\"card\"><div class=\"lbl\">Max CogCRAP</div><div class=\"val\">{htmlScore r.maxCogCrap}</div><div>avg {htmlScore r.avgCogCrap} (&gt;30: {r.cogCrapOver30})</div></div>"
+  if let some pr := patch? then
+    let pVal := if pr.sitesTotal == 0 then "n/a" else htmlPct pr.branchCov
+    parts := parts.push s!"<div class=\"card\"><div class=\"lbl\">Patch ({htmlEscape pr.baseRef})</div><div class=\"val {htmlCovClass pr.branchCov}\">{pVal}</div><div>{pr.sitesHit}/{pr.sitesTotal}</div></div>"
   parts := parts.push "</div>"
 
   if !r.byKind.isEmpty then
@@ -141,8 +148,20 @@ private def renderIndexHtml (r : SummaryReport) : String := Id.run do
   parts := parts.push indexSortFilterJs
   return renderHtmlDoc "LeanCov Report" ("\n".intercalate parts.toList)
 
+private def changedLineSet (file : String) (changedLines? : Option (Std.HashMap String (Array Nat))) :
+    Std.HashMap Nat Bool := Id.run do
+  let some mp := changedLines? | return {}
+  let mut out : Std.HashMap Nat Bool := {}
+  for (df, lns) in mp.toList do
+    if pathMatchesSuffix file df then
+      for ln in lns do
+        out := out.insert ln true
+  return out
+
 private def renderSourcePage (fr : FileReport) (srcRoot : System.FilePath) (fileSites : Array Site)
-    (fileFuncs : Array FuncReport) (hits : Array UInt64) : IO String := do
+    (fileFuncs : Array FuncReport) (hits : Array UInt64)
+    (changedLines? : Option (Std.HashMap String (Array Nat)) := none) : IO String := do
+  let diffLines := changedLineSet fr.file changedLines?
   let mut parts : Array String := #[]
   parts := parts.push "<p><a href=\"../index.html\">&larr; All Files</a></p>"
   parts := parts.push s!"<h1>{htmlEscape fr.file}</h1>"
@@ -190,21 +209,23 @@ private def renderSourcePage (fr : FileReport) (srcRoot : System.FilePath) (file
           let mx := ss.foldl (fun m s => max m (siteHitCount hits s.id)) 0
           let cls := if allHit then "ln-hit" else if anyHit then "ln-part" else "ln-miss"
           (cls, s!"{mx}x")
-      let mut badges := ""
+      let diffCls := if diffLines.contains ln then " ln-diff" else ""
+      let mut badges := if diffLines.contains ln then "<span class=\"badge b-diff\">[diff]</span>" else ""
       for s in ss do
         let c := siteHitCount hits s.id
         let bCls := if c > 0 then "b-hit" else "b-miss"
         badges := badges ++ s!"<span class=\"badge {bCls}\">[{htmlEscape s.kind.toString} {c}]</span>"
-      parts := parts.push s!"<tr id=\"L{ln}\" class=\"{rowCls}\"><td class=\"lnum\"><a href=\"#L{ln}\">{ln}</a></td><td class=\"hits\">{hitsTxt}</td><td class=\"code\"><pre>{htmlEscape lines[idx]!}</pre>{badges}</td></tr>"
+      parts := parts.push s!"<tr id=\"L{ln}\" class=\"{rowCls}{diffCls}\"><td class=\"lnum\"><a href=\"#L{ln}\">{ln}</a></td><td class=\"hits\">{hitsTxt}</td><td class=\"code\"><pre>{htmlEscape lines[idx]!}</pre>{badges}</td></tr>"
     parts := parts.push "</tbody></table></div>"
   return renderHtmlDoc fr.file ("\n".intercalate parts.toList)
 
 /-- Write a self-contained static HTML coverage site (`index.html` + `files/*.html`) to `outDir`. -/
 def writeHtmlReport (outDir srcRoot : System.FilePath) (m : Manifest) (hits : Array UInt64)
-    (rep : SummaryReport) : IO Unit := do
+    (rep : SummaryReport) (changedLines? : Option (Std.HashMap String (Array Nat)) := none)
+    (patch? : Option PatchReport := none) : IO Unit := do
   let filesDir := outDir / "files"
   IO.FS.createDirAll filesDir
-  IO.FS.writeFile (outDir / "index.html") (renderIndexHtml rep)
+  IO.FS.writeFile (outDir / "index.html") (renderIndexHtml rep patch?)
   let mut sitesByFile : Std.HashMap String (Array Site) := {}
   for s in m.sites do
     sitesByFile := sitesByFile.insert s.file ((sitesByFile.getD s.file #[]).push s)
@@ -212,7 +233,56 @@ def writeHtmlReport (outDir srcRoot : System.FilePath) (m : Manifest) (hits : Ar
   for f in rep.functions do
     funcsByFile := funcsByFile.insert f.file ((funcsByFile.getD f.file #[]).push f)
   for fr in rep.files do
-    let page ← renderSourcePage fr srcRoot (sitesByFile.getD fr.file #[]) (funcsByFile.getD fr.file #[]) hits
+    let page ← renderSourcePage fr srcRoot (sitesByFile.getD fr.file #[]) (funcsByFile.getD fr.file #[]) hits changedLines?
     IO.FS.writeFile (filesDir / safeHtmlFileName fr.file) page
+
+private def mutateFilterJs : String :=
+"<script>
+(function(){
+  var q = document.getElementById('mut-q');
+  var sel = document.getElementById('mut-out');
+  var tbl = document.getElementById('mut-tbl');
+  if (!tbl) return;
+  function apply(){
+    var v = q ? q.value.toLowerCase() : '';
+    var o = sel ? sel.value : 'all';
+    var rows = tbl.tBodies[0].rows;
+    for (var i=0;i<rows.length;i++){
+      var r = rows[i];
+      var matchOut = (o === 'all') || (r.getAttribute('data-o') === o);
+      var matchTxt = !v || r.textContent.toLowerCase().indexOf(v) >= 0;
+      r.style.display = (matchOut && matchTxt) ? '' : 'none';
+    }
+  }
+  if (q) q.addEventListener('input', apply);
+  if (sel) sel.addEventListener('change', apply);
+})();
+</script>"
+
+/-- Write a self-contained single-file HTML mutation report with live outcome filtering. -/
+def writeMutateHtml (outFile : System.FilePath) (r : MutateReport) : IO Unit := do
+  if let some p := outFile.parent then IO.FS.createDirAll p
+  let scoreRatio := r.score / 100.0
+  let mut parts : Array String := #[]
+  parts := parts.push "<h1>LeanCov Mutation Report</h1>"
+  parts := parts.push "<div class=\"cards\">"
+  parts := parts.push s!"<div class=\"card\"><div class=\"lbl\">Mutation Score</div><div class=\"val {htmlCovClass scoreRatio}\">{htmlScore r.score}%</div><div>{r.proved + r.killed + r.timeout}/{r.tested}</div></div>"
+  parts := parts.push s!"<div class=\"card\"><div class=\"lbl\">Survived</div><div class=\"val {if r.survived == 0 then "ok" else "bad"}\">{r.survived}</div><div>of {r.tested} tested</div></div>"
+  parts := parts.push s!"<div class=\"card\"><div class=\"lbl\">Killed / Proved</div><div class=\"val ok\">{r.killed + r.proved}</div><div>killed {r.killed}, proved {r.proved}</div></div>"
+  parts := parts.push s!"<div class=\"card\"><div class=\"lbl\">Timeout / Skipped</div><div class=\"val\">{r.timeout}</div><div>uncomp {r.uncompilable}, uncov {r.uncovered}</div></div>"
+  parts := parts.push "</div>"
+  parts := parts.push "<div class=\"controls\"><input id=\"mut-q\" class=\"search\" style=\"margin:0\" type=\"search\" placeholder=\"Filter file, decl, mutation...\"><select id=\"mut-out\"><option value=\"all\">All outcomes</option><option value=\"survived\">Survived</option><option value=\"killed\">Killed</option><option value=\"proved\">Proved</option><option value=\"timeout\">Timeout</option><option value=\"uncompilable\">Uncompilable</option><option value=\"uncovered\">Uncovered</option></select></div>"
+  parts := parts.push "<table id=\"mut-tbl\"><thead><tr><th>Location</th><th>Declaration</th><th>Kind</th><th>Mutation</th><th>Outcome</th><th class=\"num\">Time</th></tr></thead><tbody>"
+  for res in r.results do
+    let m := res.mutant
+    let oStr := res.outcome.toString
+    let oCls := match res.outcome with
+      | .killed | .proved | .timeout => "ok"
+      | .survived => "bad"
+      | .uncompilable | .uncovered => "warn"
+    parts := parts.push s!"<tr data-o=\"{oStr}\"><td><code>{htmlEscape m.file}:{m.line}:{m.col}</code></td><td><code>{htmlEscape m.decl}</code></td><td><code>{htmlEscape m.kind.toString}</code></td><td><code>{htmlEscape m.original}</code> &rarr; <code>{htmlEscape m.replacement}</code></td><td class=\"{oCls}\">{oStr}</td><td class=\"num\">{res.elapsedMs}ms</td></tr>"
+  parts := parts.push "</tbody></table>"
+  parts := parts.push mutateFilterJs
+  IO.FS.writeFile outFile (renderHtmlDoc "LeanCov Mutation Report" ("\n".intercalate parts.toList))
 
 end LeanCov.Cov
