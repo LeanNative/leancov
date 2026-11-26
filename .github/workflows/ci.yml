@@ -80,11 +80,11 @@ jobs:
           EOF
           cat > build/action_smoke/leancov.toml <<'EOF'
           [leancov]
-          out = "build/action_smoke/out"
+          out = "out"
           min_cov = 40.0
           [[package]]
           name = "smoke"
-          pkg = "build/action_smoke"
+          pkg = "."
           src_dirs = ["Demo"]
           exclude = ["Main.lean"]
           [[suite]]
