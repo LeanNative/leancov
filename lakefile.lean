@@ -2,7 +2,7 @@ import Lake
 open Lake DSL
 
 package «leancov» where
-  version := v!"0.5.0"
+  version := v!"0.6.0"
   description := "Source-level branch & line coverage, McCabe/Cognitive CRAP, AST mutation testing, and greybox fuzzing for Lean 4"
   keywords := #["coverage", "testing", "mutation-testing", "fuzzing", "crap", "lcov"]
   homepage := "https://github.com/LeanNative/leancov"

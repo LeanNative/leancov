@@ -3,9 +3,9 @@ description: "Install LeanCov and run source-level Lean 4 coverage, complexity, 
 
 inputs:
   version:
-    description: "LeanCov release tag (e.g. v0.5.0, or 'local' to build action_path)"
+    description: "LeanCov release tag (e.g. v0.6.0, or 'local' to build action_path)"
     required: false
-    default: "v0.5.0"
+    default: "v0.6.0"
   config:
     description: "Path to leancov.toml configuration file"
     required: false
@@ -14,6 +14,18 @@ inputs:
     description: "Extra arguments passed to `leancov test`"
     required: false
     default: ""
+  git-diff:
+    description: "Base git ref for PR patch coverage & diff-highlighted HTML"
+    required: false
+    default: ""
+  min-patch-cov:
+    description: "Minimum branch coverage percentage for changed lines"
+    required: false
+    default: ""
+  dead:
+    description: "Run call-graph gap analysis (--dead) on 0% declarations"
+    required: false
+    default: "false"
   min-cov:
     description: "Minimum branch coverage percentage gate"
     required: false
@@ -104,6 +116,9 @@ runs:
         HTML_DIR="${OUT_DIR}/html"
         MD_FILE="${OUT_DIR}/report.md"
         CMD=("${{ steps.install.outputs.bin }}" "test" "--config" "$CFG" "--leancov" "${{ steps.install.outputs.root }}" "--html" "$HTML_DIR" "--markdown" "$MD_FILE")
+        if [ -n "${{ inputs.git-diff }}" ]; then CMD+=("--git-diff" "${{ inputs.git-diff }}"); fi
+        if [ -n "${{ inputs.min-patch-cov }}" ]; then CMD+=("--min-patch-cov" "${{ inputs.min-patch-cov }}"); fi
+        if [ "${{ inputs.dead }}" = "true" ]; then CMD+=("--dead"); fi
         if [ -n "${{ inputs.min-cov }}" ]; then CMD+=("--min-cov" "${{ inputs.min-cov }}"); fi
         if [ -n "${{ inputs.max-crap }}" ]; then CMD+=("--max-crap" "${{ inputs.max-crap }}"); fi
         if [ -n "${{ inputs.max-cog-crap }}" ]; then CMD+=("--max-cog-crap" "${{ inputs.max-cog-crap }}"); fi

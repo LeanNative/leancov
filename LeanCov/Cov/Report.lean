@@ -799,6 +799,7 @@ def formatStaticAnalysis (m : Manifest) (topN : Nat := 30) (sortByCog : Bool := 
 inductive DeadCategory where
   | unreferenced
   | calledByCovered
+  | calledByInit
   | calledByUncovered
   deriving Repr, BEq, Inhabited
 
@@ -816,8 +817,55 @@ structure DeadFuncEntry where
 structure DeadReport where
   unreferenced : Array DeadFuncEntry := #[]
   calledByCovered : Array DeadFuncEntry := #[]
+  calledByInit : Array DeadFuncEntry := #[]
   calledByUncovered : Array DeadFuncEntry := #[]
   deriving Repr, BEq, Inhabited
+
+private def stripLineComment (acc : List Char) : List Char → (List Char × List Char)
+  | [] => (acc, [])
+  | '\n' :: tl => ('\n' :: acc, tl)
+  | _ :: tl => stripLineComment acc tl
+
+private def stripBlockComment : Nat → List Char → List Char → (List Char × List Char)
+  | _, acc, [] => (acc, [])
+  | depth, acc, '/' :: '-' :: tl => stripBlockComment (depth + 1) acc tl
+  | depth, acc, '-' :: '/' :: tl =>
+    if depth ≤ 1 then (acc, tl) else stripBlockComment (depth - 1) acc tl
+  | depth, acc, '\n' :: tl => stripBlockComment depth ('\n' :: acc) tl
+  | depth, acc, _ :: tl => stripBlockComment depth acc tl
+
+private def stripStrLit (acc : List Char) : List Char → (List Char × List Char)
+  | [] => (acc, [])
+  | '\\' :: c :: tl => stripStrLit (c :: '\\' :: acc) tl
+  | '"' :: tl => ('"' :: acc, tl)
+  | c :: tl => stripStrLit (c :: acc) tl
+
+/-- Strip `--` line comments and nested `/- ... -/` block comments while preserving string literals and newlines. -/
+def stripLeanComments (src : String) : String := Id.run do
+  let mut acc : List Char := []
+  let mut cs := src.toList
+  while !cs.isEmpty do
+    match cs with
+    | [] => break
+    | '\'' :: '\\' :: c :: '\'' :: tl =>
+      acc := '\'' :: c :: '\\' :: '\'' :: acc
+      cs := tl
+    | '\'' :: '"' :: '\'' :: tl =>
+      acc := '\'' :: '"' :: '\'' :: acc
+      cs := tl
+    | '-' :: '-' :: tl =>
+      let (acc', rest) := stripLineComment acc tl
+      acc := acc'; cs := rest
+    | '/' :: '-' :: tl =>
+      let (acc', rest) := stripBlockComment 1 acc tl
+      acc := acc'; cs := rest
+    | '"' :: tl =>
+      let (acc', rest) := stripStrLit ('"' :: acc) tl
+      acc := acc'; cs := rest
+    | c :: tl =>
+      acc := c :: acc
+      cs := tl
+  return String.ofList acc.reverse
 
 private def extractIdentTokens (text : String) : Std.HashMap String Bool := Id.run do
   let mut out : Std.HashMap String Bool := {}
@@ -831,16 +879,82 @@ private def extractIdentTokens (text : String) : Std.HashMap String Bool := Id.r
   if !cur.isEmpty then out := out.insert cur true
   return out
 
-/-- Classify 0%-covered declarations into `calledByCovered` (test gaps), `calledByUncovered`, and `unreferenced`. -/
+private def skipInitPrefixes : Array String :=
+  #["import ", "open ", "namespace ", "end ", "section ", "variable ", "universe ", "set_option ", "attribute "]
+
+private def proofDeclPrefixes : Array String :=
+  #["theorem ", "lemma ", "example ", "private theorem ", "protected theorem "]
+
+private def nonProofDeclPrefixes : Array String :=
+  #["def ", "private def ", "protected def ", "abbrev ", "instance ", "initialize ",
+    "structure ", "inductive ", "class ", "macro ", "syntax ", "elab "]
+
+private def hasAnyPrefix (t : String) (pfxs : Array String) : Bool :=
+  pfxs.any fun p => t.startsWith p
+
+private def collectInitTokens (lines : Array String) (funcsInFile : Array FuncInfo) : Std.HashMap String Bool := Id.run do
+  let mut inside := Array.replicate lines.size false
+  for f in funcsInFile do
+    let lo := if f.line > 0 then f.line - 1 else 0
+    let hi := min f.endLine lines.size
+    for i in [lo:hi] do
+      inside := inside.set! i true
+  let mut inProof := false
+  let mut toks : Std.HashMap String Bool := {}
+  for idx in [:lines.size] do
+    if inside[idx]! then
+      inProof := false
+      continue
+    let t := lines[idx]!.trimAscii.copy
+    if hasAnyPrefix t proofDeclPrefixes then
+      inProof := true
+      continue
+    if hasAnyPrefix t nonProofDeclPrefixes then
+      inProof := false
+    if inProof || t.isEmpty || hasAnyPrefix t skipInitPrefixes then continue
+    for (k, _) in (extractIdentTokens t).toList do
+      toks := toks.insert k true
+  return toks
+
+private def funcShortName (f : FuncInfo) : String :=
+  (f.name.splitOn ".").getLast?.getD f.name
+
+private def isTrackableDeadFunc (hits : Array UInt64) (f : FuncInfo) : Bool :=
+  let covered := f.siteIds.any fun sid => hitAt hits sid > 0
+  !f.siteIds.isEmpty && !covered && !f.name.startsWith "(" && !(funcShortName f).isEmpty
+
+private def propagateInitCallers (candidates : Array (FuncInfo × Array String × Array String))
+    (globalInitTokens : Std.HashMap String Bool) : Std.HashMap String (Array String) := Id.run do
+  let mut initCallers : Std.HashMap String (Array String) := {}
+  for (f, covCallers, _) in candidates do
+    if covCallers.isEmpty && globalInitTokens.contains (funcShortName f) then
+      initCallers := initCallers.insert f.name #["<module-init/CAF>"]
+  let mut changed := true
+  while changed do
+    changed := false
+    for (f, covCallers, uncovCallers) in candidates do
+      if covCallers.isEmpty && !initCallers.contains f.name then
+        let viaInit := uncovCallers.filter fun c => initCallers.contains c
+        if !viaInit.isEmpty then
+          initCallers := initCallers.insert f.name (viaInit.take 4)
+          changed := true
+  return initCallers
+
+/-- Classify 0%-covered declarations into `calledByCovered` (test gaps), `calledByInit`, `calledByUncovered`, and `unreferenced`. -/
 def analyzeDeadFunctions (m : Manifest) (hits : Array UInt64) (srcRoot : System.FilePath) : IO DeadReport := do
   let mut fileCache : Std.HashMap String (Array String) := {}
   for f in m.functions do
     unless fileCache.contains f.file do
       let ls ← try
         let raw ← IO.FS.readFile (srcRoot / f.file)
-        pure (raw.splitOn "\n").toArray
+        pure ((stripLeanComments raw).splitOn "\n").toArray
       catch _ => pure #[]
       fileCache := fileCache.insert f.file ls
+  let mut globalInitTokens : Std.HashMap String Bool := {}
+  for (file, lines) in fileCache.toList do
+    let inFile := m.functions.filter (·.file == file)
+    for (k, _) in (collectInitTokens lines inFile).toList do
+      globalInitTokens := globalInitTokens.insert k true
   let isCovered (f : FuncInfo) : Bool :=
     f.siteIds.any fun sid => hitAt hits sid > 0
   let mut bodyTokens : Array (FuncInfo × Bool × Std.HashMap String Bool) := Array.mkEmpty m.functions.size
@@ -850,36 +964,47 @@ def analyzeDeadFunctions (m : Manifest) (hits : Array UInt64) (srcRoot : System.
     let hi := min f.endLine lines.size
     let slice := if lo < hi then "\n".intercalate ((lines.extract lo hi).toList) else ""
     bodyTokens := bodyTokens.push (f, isCovered f, extractIdentTokens slice)
-  let mut unref : Array DeadFuncEntry := #[]
-  let mut byCov : Array DeadFuncEntry := #[]
-  let mut byUncov : Array DeadFuncEntry := #[]
+  let mut candidates : Array (FuncInfo × Array String × Array String) := #[]
   for f in m.functions do
-    if f.siteIds.isEmpty || isCovered f || f.name.startsWith "(" then continue
-    let shortName := (f.name.splitOn ".").getLast?.getD f.name
-    if shortName.isEmpty then continue
+    if !isTrackableDeadFunc hits f then continue
+    let sn := funcShortName f
     let mut covCallers : Array String := #[]
     let mut uncovCallers : Array String := #[]
     for (caller, cov, toks) in bodyTokens do
-      if caller.name != f.name && toks.contains shortName then
+      if caller.name != f.name && toks.contains sn then
         if cov then covCallers := covCallers.push caller.name
         else uncovCallers := uncovCallers.push caller.name
+    candidates := candidates.push (f, covCallers, uncovCallers)
+  let initCallers := propagateInitCallers candidates globalInitTokens
+  let mut unref : Array DeadFuncEntry := #[]
+  let mut byCov : Array DeadFuncEntry := #[]
+  let mut byInit : Array DeadFuncEntry := #[]
+  let mut byUncov : Array DeadFuncEntry := #[]
+  for (f, covCallers, uncovCallers) in candidates do
     if !covCallers.isEmpty then
       byCov := byCov.push { name := f.name, file := f.file, line := f.line, sitesTotal := f.siteIds.size, category := .calledByCovered, callers := covCallers.take 4 }
+    else if let some ic := initCallers.get? f.name then
+      byInit := byInit.push { name := f.name, file := f.file, line := f.line, sitesTotal := f.siteIds.size, category := .calledByInit, callers := ic }
     else if !uncovCallers.isEmpty then
       byUncov := byUncov.push { name := f.name, file := f.file, line := f.line, sitesTotal := f.siteIds.size, category := .calledByUncovered, callers := uncovCallers.take 4 }
     else
       unref := unref.push { name := f.name, file := f.file, line := f.line, sitesTotal := f.siteIds.size, category := .unreferenced }
-  return { unreferenced := unref, calledByCovered := byCov, calledByUncovered := byUncov }
+  return { unreferenced := unref, calledByCovered := byCov, calledByInit := byInit, calledByUncovered := byUncov }
 
 /-- Format `DeadReport` for terminal inspection. -/
 def formatDeadReport (d : DeadReport) (topN : Nat := 20) : String := Id.run do
   let mut out : Array String := #[]
   out := out.push "=== LeanCov Call-Graph Gap Analysis (0% functions) ==="
-  out := out.push s!"Called by covered (test gaps): {d.calledByCovered.size} | Called only by uncovered: {d.calledByUncovered.size} | Unreferenced: {d.unreferenced.size}"
+  out := out.push s!"Called by covered (test gaps): {d.calledByCovered.size} | Module-init/CAF: {d.calledByInit.size} | Called only by uncovered: {d.calledByUncovered.size} | Unreferenced: {d.unreferenced.size}"
   if topN > 0 && !d.calledByCovered.isEmpty then
     out := out.push ""
     out := out.push "Test gaps (0% target called from covered code):"
     for e in d.calledByCovered.take topN do
+      out := out.push s!"  {e.name} ({e.file}:{e.line}, {e.sitesTotal} sites) <- {", ".intercalate e.callers.toList}"
+  if topN > 0 && !d.calledByInit.isEmpty then
+    out := out.push ""
+    out := out.push "Module-init / CAF (excluded from runtime hits):"
+    for e in d.calledByInit.take topN do
       out := out.push s!"  {e.name} ({e.file}:{e.line}, {e.sitesTotal} sites) <- {", ".intercalate e.callers.toList}"
   if topN > 0 && !d.unreferenced.isEmpty then
     out := out.push ""

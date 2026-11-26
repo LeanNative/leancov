@@ -21,7 +21,7 @@ namespace LeanCov.CLI
 open Lean LeanCov.Cov
 
 /-- Package version printed by `leancov --version` / `-V`. -/
-def version : String := "0.5.0"
+def version : String := "0.6.0"
 
 private def usage : String :=
 "leancov — source-level Lean 4 coverage, McCabe CRAP, Cognitive Complexity, and AST Mutation Testing
@@ -45,7 +45,8 @@ Usage:
   leancov test       [--config <leancov.toml>] [--leancov <leancovDir>] [--fast] [--clean]
                      [--no-build] [--report] [--list] [--jobs <N>]
                      [--sort crap|cog|cc|uncov|cov] [--top <N>]
-                     [--html <dir>] [--markdown <out.md>] [--exclude-instances]
+                     [--html <dir>] [--markdown <out.md>] [--exclude-instances] [--dead]
+                     [--git-diff <baseRef>] [--repo <dir>] [--min-patch-cov <pct>]
                      [--min-cov <pct>] [--max-crap <val>] [--max-cog-crap <val>] [suite ...]
   leancov diff       --base <old.json> --head <new.json> [--top <N>]
                      [--json <out.json>] [--markdown <out.md>]
@@ -524,7 +525,7 @@ private def runtimeOnlyLakefile : String :=
 open Lake DSL
 
 package «leancov» where
-  version := v!\"0.5.0\"
+  version := v!\"0.6.0\"
 
 target leancov_rt.o pkg : System.FilePath := do
   let oFile := pkg.buildDir / \"c\" / \"leancov_rt.o\"
@@ -1290,6 +1291,10 @@ private structure TestOpts where
   htmlDir? : Option System.FilePath := none
   mdFile? : Option System.FilePath := none
   excludeInstances : Bool := false
+  dead : Bool := false
+  gitDiff? : Option String := none
+  repoDir? : Option System.FilePath := none
+  minPatchCov? : Option Float := none
   minCov? : Option Float := none
   maxCrap? : Option Float := none
   maxCogCrap? : Option Float := none
@@ -1320,6 +1325,13 @@ private def parseTestArgs : List String → TestOpts → Except String TestOpts
   | "--html" :: v :: tl, o => parseTestArgs tl { o with htmlDir? := some ⟨v⟩ }
   | "--markdown" :: v :: tl, o => parseTestArgs tl { o with mdFile? := some ⟨v⟩ }
   | "--exclude-instances" :: tl, o => parseTestArgs tl { o with excludeInstances := true }
+  | "--dead" :: tl, o => parseTestArgs tl { o with dead := true }
+  | "--git-diff" :: v :: tl, o => parseTestArgs tl { o with gitDiff? := some v }
+  | "--repo" :: v :: tl, o => parseTestArgs tl { o with repoDir? := some ⟨v⟩ }
+  | "--min-patch-cov" :: v :: tl, o =>
+    match parseFloat? v with
+    | some f => parseTestArgs tl { o with minPatchCov? := some f }
+    | none => throw s!"invalid --min-patch-cov value: {v}"
   | "--min-cov" :: v :: tl, o =>
     match parseFloat? v with
     | some f => parseTestArgs tl { o with minCov? := some f }
@@ -1487,6 +1499,10 @@ private def buildTestReportArgs (cfg : ProjectConfig) (opts : TestOpts)
   if cfg.files then repArgs := repArgs ++ ["--files"]
   if cfg.kinds then repArgs := repArgs ++ ["--kinds"]
   if opts.excludeInstances || cfg.excludeInstances then repArgs := repArgs ++ ["--exclude-instances"]
+  if opts.dead then repArgs := repArgs ++ ["--dead"]
+  if let some gd := opts.gitDiff? then repArgs := repArgs ++ ["--git-diff", gd]
+  if let some rd := opts.repoDir? then repArgs := repArgs ++ ["--repo", rd.toString]
+  if let some mp := opts.minPatchCov? then repArgs := repArgs ++ ["--min-patch-cov", toString mp]
   for ek in cfg.excludeKinds do repArgs := repArgs ++ ["--exclude-kind", ek.toString]
   if let some hd := opts.htmlDir? then repArgs := repArgs ++ ["--html", hd.toString]
   else if cfg.html then repArgs := repArgs ++ ["--html", (outDir / "html").toString]
@@ -1529,17 +1545,26 @@ private unsafe def cmdTest (args : List String) : IO UInt32 := do
     return 1
   return repCode
 
+private def hasHelpFlag : List String → Bool
+  | [] => false
+  | "--" :: _ => false
+  | "--help" :: _ | "-h" :: _ => true
+  | _ :: tl => hasHelpFlag tl
+
 unsafe def runCLI (args : List String) : IO UInt32 := do
+  let dispatchHelp (rest : List String) (fn : List String → IO UInt32) : IO UInt32 :=
+    if hasHelpFlag rest then do IO.println usage; return 0
+    else fn rest
   match args with
-  | "instrument" :: rest => cmdInstrument rest
-  | "stage" :: rest => cmdStage rest
-  | "run" :: rest => cmdRun rest
-  | "merge" :: rest => cmdMerge rest
-  | "report" :: rest => cmdReport rest
-  | "test" :: rest => cmdTest rest
-  | "diff" :: rest => cmdDiff rest
-  | "analyze" :: rest => cmdAnalyze rest
-  | "mutate" :: rest => cmdMutate rest
+  | "instrument" :: rest => dispatchHelp rest cmdInstrument
+  | "stage" :: rest => dispatchHelp rest cmdStage
+  | "run" :: rest => dispatchHelp rest cmdRun
+  | "merge" :: rest => dispatchHelp rest cmdMerge
+  | "report" :: rest => dispatchHelp rest cmdReport
+  | "test" :: rest => dispatchHelp rest cmdTest
+  | "diff" :: rest => dispatchHelp rest cmdDiff
+  | "analyze" :: rest => dispatchHelp rest cmdAnalyze
+  | "mutate" :: rest => dispatchHelp rest cmdMutate
   | "--version" :: _ | "-V" :: _ =>
     IO.println s!"leancov {version}"
     return 0

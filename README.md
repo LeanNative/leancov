@@ -87,7 +87,7 @@ ln -sf "$(pwd)/.lake/build/bin/leancov" ~/.local/bin/leancov
 export PATH="$(pwd)/.lake/build/bin:$PATH"
 
 # Verify installation
-leancov --version   # prints: leancov 0.5.0
+leancov --version   # prints: leancov 0.6.0
 ```
 
 > **Note on toolchain lookup:** `leancov` walks up from its resolved executable path to find its own `lean-toolchain` and Lean sysroot, so symlinking `.lake/build/bin/leancov` works from any working directory. If you copy the binary out of the checkout, set `LEAN_SYSROOT="$(lean --print-prefix)"`.
@@ -296,9 +296,10 @@ Example GitHub Actions step using the reusable `LeanNative/leancov` composite ac
 
 ```yaml
 - name: LeanCov Coverage & Quality Gates
-  uses: LeanNative/leancov@v0.5.0
+  uses: LeanNative/leancov@v0.6.0
   with:
     config: leancov.toml
+    git-diff: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
     min-cov: "75.0"
     max-crap: "100.0"
     max-cog-crap: "200.0"

@@ -2405,6 +2405,85 @@ def coveredCaller (x : Nat) : Nat := if x > 0 then gapTarget x else 0
 
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
 
+private unsafe def testV060Features : TM Unit := do
+  let dir : System.FilePath := ".lake/build/tmp_v060"
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+  let repo := dir / "caf_repo"
+  IO.FS.createDirAll (repo / "Src")
+  let srcBody :=
+"import Init
+
+-- mention orphanDead in line comment
+/- nested /- block comment mentioning orphanDead -/ still comment -/
+def litWithCommentSyntax : String := \"-- fake comment \\\" and '\" ++ String.singleton '\"'
+
+def orphanDead (x : Nat) : Nat := if x > 2 then x else 2
+
+def cafLeaf (x : Nat) : Nat := if x > 0 then x else 0
+
+def cafHelper (x : Nat) : Nat := cafLeaf (x + 1)
+
+def lookupTbl : Array Nat := #[cafHelper 1]
+
+theorem skipThm : True := trivial
+
+-- EOF line comment mentioning orphanDead"
+  IO.FS.writeFile (repo / "Src" / "Caf.lean") srcBody
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "init"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "config", "user.email", "ci@example.com"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "config", "user.name", "CI"] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "add", "."] }
+  let _ ← IO.Process.output { cmd := "git", args := #["-C", repo.toString, "commit", "-m", "base"] }
+  let env ← loadParserEnv #[]
+  let instRes ← instrumentSource env "Caf.lean" srcBody 0 {}
+  let m : Manifest := { sites := instRes.sites, functions := instRes.functions }
+  let hits := Array.replicate m.sites.size (0 : UInt64)
+  let deadRep ← analyzeDeadFunctions m hits (repo / "Src")
+  check "calledByInit contains cafHelper" (deadRep.calledByInit.any (·.name == "cafHelper"))
+  check "calledByInit contains cafLeaf transitively" (deadRep.calledByInit.any (·.name == "cafLeaf"))
+  check "orphanDead stays unreferenced despite comments & theorem" (deadRep.unreferenced.any (·.name == "orphanDead"))
+  let repTxt := formatDeadReport deadRep 10
+  check "formatDeadReport renders Module-init/CAF" ((repTxt.splitOn "Module-init/CAF").length > 1 && (repTxt.splitOn "cafHelper").length > 1)
+  check "stripLeanComments strips comments & preserves strings" (((stripLeanComments "a -- b\n\"--\"").splitOn "\"--\"").length == 2)
+  check "stripLeanComments strips nested block comment" (((stripLeanComments "x /- /- y -/ -/ z").splitOn "y").length == 1)
+
+  -- Subcommand `--help` / `-h` (and stops scanning at `--`)
+  checkEq "report --help" (← LeanCov.CLI.runCLI ["report", "--help"]) 0
+  checkEq "test -h" (← LeanCov.CLI.runCLI ["test", "-h"]) 0
+  checkEq "mutate --help" (← LeanCov.CLI.runCLI ["mutate", "--help"]) 0
+  checkEq "run --help" (← LeanCov.CLI.runCLI ["run", "--help"]) 0
+  let sitesPath := repo / "out" / "sites.json"
+  let profPath := repo / "out" / "profiles" / "s.cov"
+  IO.FS.createDirAll (repo / "out" / "profiles")
+  IO.FS.writeFile sitesPath (toJson m).pretty
+  writeProfile profPath hits
+  checkEq "run stops --help check after --" (← LeanCov.CLI.runCLI [
+    "run", "--sites", sitesPath.toString, "--profile", (dir / "after_dd.cov").toString, "--", "echo", "--help"
+  ]) 0
+
+  -- `leancov test` --dead / --git-diff / --repo / --min-patch-cov
+  checkEq "test invalid --min-patch-cov" (← LeanCov.CLI.runCLI ["test", "--min-patch-cov", "bad"]) 2
+  let cfgPath := repo / "leancov.toml"
+  IO.FS.writeFile cfgPath "
+[leancov]
+out = \"out\"
+
+[[package]]
+name = \"caf\"
+pkg = \".\"
+src_dirs = [\"Src\"]
+
+[[suite]]
+name = \"s\"
+package = \"caf\"
+"
+  IO.FS.writeFile (repo / "Src" / "Caf.lean") (srcBody ++ "\ndef addedFn (x : Nat) : Nat := if x > 3 then x else 3\n")
+  checkEq "leancov test --report --dead --git-diff --repo --min-patch-cov" (← LeanCov.CLI.runCLI [
+    "test", "--config", cfgPath.toString, "--report",
+    "--dead", "--git-diff", "HEAD", "--repo", repo.toString, "--min-patch-cov", "0"
+  ]) 0
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+
 unsafe def main : IO UInt32 :=
   runMain "leancov-test" do
     runTest "types & binary profiles" testTypesAndProfiles
@@ -2416,6 +2495,7 @@ unsafe def main : IO UInt32 :=
     runTest "v0.4.0 while-true, instances, kinds & config" testV040Features
     runTest "v0.4.0 leancov test & parallel mutate e2e" testConfigAndTestCLI
     runTest "v0.5.0 const/result mut, dead graph & PR diff HTML" testV050Features
+    runTest "v0.6.0 CAF dead graph, subcommand help & PR test flags" testV060Features
     runTest "fuzz primitives & mutator" testFuzzPrimitives
     runTest "exact binary runtime counters (ground truth)" testExactRuntimeCounters
     runTest "AST mutation engine & mutate CLI" testMutateEngineAndCLI
