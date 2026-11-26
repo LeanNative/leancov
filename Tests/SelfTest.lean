@@ -2002,6 +2002,256 @@ private unsafe def testV030CLI : TM Unit := do
   ]) 2
   let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
 
+private unsafe def testV040Features : TM Unit := do
+  let env ← loadParserEnv
+  -- 1. `while true` & `while (Bool.true)` suppress `loop.skip`, `instance` tags `FuncInfo.isInstance`
+  let src := "
+def whileCases (flag : Bool) : IO Nat := do
+  let mut x := 0
+  while true do
+    x := x + 1
+    break
+  while (Bool.true) do
+    x := x + 1
+    break
+  while flag do
+    x := x + 1
+    break
+  return x
+
+structure Pair where
+  a : Nat
+
+instance : BEq Pair where
+  beq x y := x.a == y.a
+"
+  let res ← instrumentSource env "WhileInst.lean" src 0 {}
+  checkEq "WhileInst parses cleanly" res.skippedReason none
+  let wf ← need "whileCases found" (match res.functions.find? (·.name == "whileCases") with | some f => Except.ok f | none => Except.error "missing")
+  let wfKinds := wf.siteIds.filterMap fun id => res.sites[id]?.map (·.kind)
+  checkEq "whileCases has 3 loop.body sites" (wfKinds.countP (· == .loopBody)) 3
+  checkEq "whileCases has only 1 loop.skip site (dynamic while)" (wfKinds.countP (· == .loopSkip)) 1
+  check "whileCases is not instance" (!wf.isInstance)
+  let instFn ← need "BEq Pair instance found" (match res.functions.find? (·.isInstance) with | some f => Except.ok f | none => Except.error "missing")
+  check "filterManifest excludeInstances drops instance & keeps whileCases" (
+    let fm := filterManifest { sites := res.sites, functions := res.functions } { excludeInstances := true }
+    !fm.functions.any (·.name == instFn.name) && fm.functions.any (·.name == "whileCases")
+  )
+
+  -- Backwards-compatible `FromJson FuncInfo` omitting optional fields
+  let legacyJson := "{\"name\":\"OldFn\",\"file\":\"Old.lean\",\"line\":1,\"endLine\":2,\"lines\":2,\"cc\":1,\"cognitive\":0}"
+  let parsedLegacy ← needE "parse legacy FuncInfo" id (Json.parse legacyJson >>= fromJson? : Except String FuncInfo)
+  check "legacy FuncInfo defaults isInstance=false" (!parsedLegacy.isInstance && parsedLegacy.siteIds.isEmpty)
+
+  -- 2. `MutantKind.ofAlias?` + `filterMutantsByKinds`
+  for (tok, k) in #[
+    ("cmp", MutantKind.cmpFlip), ("cmp.flip", .cmpFlip),
+    ("arith", .arithFlip), ("arith.flip", .arithFlip),
+    ("bool", .boolOpFlip), ("bool.op", .boolOpFlip),
+    ("lit", .boolLitFlip), ("bool.lit", .boolLitFlip),
+    ("neg", .negRemove), ("neg.remove", .negRemove),
+    ("cond", .condNegate), ("cond.negate", .condNegate)
+  ] do
+    checkEq s!"ofAlias? {tok}" (MutantKind.ofAlias? tok) (some k)
+  checkEq "ofAlias? bogus" (MutantKind.ofAlias? "bogus") none
+
+  let ms := #[
+    { id := 0, file := "A.lean", decl := "f", line := 1, col := 1, kind := .cmpFlip, original := "<", replacement := "≤", startByte := 0, endByte := 1, repText := "≤" },
+    { id := 1, file := "A.lean", decl := "f", line := 2, col := 1, kind := .arithFlip, original := "+", replacement := "-", startByte := 2, endByte := 3, repText := "-" }
+  ]
+  checkEq "filterMutantsByKinds empty keeps all" (filterMutantsByKinds ms #[]).size 2
+  let onlyArith := filterMutantsByKinds ms #[.arithFlip]
+  checkEq "filterMutantsByKinds arith keeps 1" onlyArith.size 1
+  checkEq "filterMutantsByKinds re-indexes id" onlyArith[0]!.id 0
+
+  -- 3. `parseProjectConfig` valid + invalid TOML
+  let goodToml := "
+# Top comment
+[leancov]
+out = \"build/lc-out\"
+jobs = 2
+sort = \"cov\"
+top = 15
+files = true
+kinds = false
+html = true
+markdown = true
+exclude_instances = true
+exclude_kinds = [
+  \"loop.skip\",
+  \"fn.entry\",
+]
+min_cov = 50.0
+max_crap = 80
+max_cog_crap = 90.5
+
+[[package]]
+name = \"core\"
+pkg = \"Core\"
+src_dirs = [\"Core\"]
+prefix = \"Core\"
+exclude = [\"Tests/\"]
+imports = [\"Init\"]
+bool_ops = false
+include_cafs = true
+
+[[package]]
+name = \"app\"
+pkg = \"App\"
+src_dirs = [\"App\"]
+deps = [\"core=core\", \"other=Ext\"] # inline comment with \"quoted\" text
+
+[[suite]]
+name = \"unit\"
+package = \"core\"
+fast = true
+
+[[suite]]
+name = \"full\"
+package = \"app\"
+target = \"app-bin\"
+args = [\"--flag\", \"val=1\", \"a\\\"b\"]
+cwd = \"App\"
+fast = false
+"
+  let pc ← needE "parse valid leancov.toml" id (parseProjectConfig goodToml)
+  checkEq "pc.out" pc.out "build/lc-out"
+  checkEq "pc.jobs" pc.jobs 2
+  checkEq "pc.sort" pc.sort .cov
+  checkEq "pc.excludeKinds" pc.excludeKinds #[.loopSkip, .fnEntry]
+  checkEq "pc.packages.size" pc.packages.size 2
+  checkEq "pc.suites.size" pc.suites.size 2
+  checkEq "suite default target = name" pc.suites[0]!.target "unit"
+  checkEq "suite explicit target" pc.suites[1]!.target "app-bin"
+  checkEq "suite fast flag" pc.suites[1]!.fast false
+
+  for badToml in #[
+    "[bogus]\n",
+    "[leancov]\nsort = \"bad\"\n",
+    "[leancov]\njobs = nope\n",
+    "[leancov]\nhtml = maybe\n",
+    "[leancov]\nout = unquoted\n",
+    "[leancov]\nmin_cov = abc\n",
+    "[leancov]\nmax_crap = abc\n",
+    "[leancov]\nmax_cog_crap = abc\n",
+    "[leancov]\nexclude_kinds = [\"bad\"]\n",
+    "[leancov]\nexclude = \"nope\"\n",
+    "[leancov]\nexclude_kinds = [\"a\" \"b\"]\n",
+    "[leancov]\nexclude_kinds = [bad]\n",
+    "[leancov]\nexclude_kinds = [\"unclosed\n",
+    "[leancov]\nunknown = 1\n",
+    "[[package]]\npkg = \".\"\n",
+    "[[package]]\nname = \"a\"\nbogus = 1\n",
+    "[[suite]]\nname = \"s\"\n",
+    "[[suite]]\nname = \"s\"\npackage = \"missing\"\n",
+    "[[suite]]\nname = \"s\"\npackage = \"a\"\nbogus = 1\n",
+    "[[package]]\nname = \"a\"\n[[suite]]\nname = \"s\"\npackage = \"missing\"\n",
+    "[leancov]\n",
+    "badline\n"
+  ] do
+    check s!"rejects invalid toml: {badToml.trimAscii.copy}" (parseProjectConfig badToml).toOption.isNone
+
+private unsafe def testConfigAndTestCLI : TM Unit := do
+  let dir : System.FilePath := ".lake/build/tmp_v040_e2e"
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+  let tc ← IO.FS.readFile "lean-toolchain"
+  IO.FS.createDirAll (dir / "PkgA" / "PkgA")
+  IO.FS.createDirAll (dir / "PkgB" / "PkgB")
+  IO.FS.writeFile (dir / "PkgA" / "lean-toolchain") tc
+  IO.FS.writeFile (dir / "PkgB" / "lean-toolchain") tc
+  IO.FS.writeFile (dir / "PkgA" / "lakefile.toml")
+    "name = \"pkga\"\ndefaultTargets = [\"suite-ok\"]\n[[lean_lib]]\nname = \"PkgA\"\n[[lean_exe]]\nname = \"suite-ok\"\nroot = \"OkMain\"\n"
+  IO.FS.writeFile (dir / "PkgA" / "PkgA.lean") "import PkgA.Core\n"
+  IO.FS.writeFile (dir / "PkgA" / "PkgA" / "Core.lean")
+    "def bumpVal (x : Nat) : Nat := if x > 0 then x + 1 else 0\n\nstructure Box where\n  n : Nat\n\ninstance : BEq Box where\n  beq a b := a.n == b.n\n"
+  IO.FS.writeFile (dir / "PkgA" / "OkMain.lean")
+    "import PkgA\ndef main : IO UInt32 := do\n  if bumpVal 2 != 3 then return 1\n  return 0\n"
+  IO.FS.writeFile (dir / "PkgB" / "lakefile.toml")
+    "name = \"pkgb\"\ndefaultTargets = [\"suite-fail\"]\n[[require]]\nname = \"pkga\"\npath = \"../PkgA\"\n[[lean_lib]]\nname = \"PkgB\"\n[[lean_exe]]\nname = \"suite-fail\"\nroot = \"FailMain\"\n"
+  IO.FS.writeFile (dir / "PkgB" / "PkgB.lean") "import PkgB.App\n"
+  IO.FS.writeFile (dir / "PkgB" / "PkgB" / "App.lean")
+    "import PkgA\ndef wrap (x : Nat) : Nat := if x > 10 then bumpVal x else 1\n"
+  IO.FS.writeFile (dir / "PkgB" / "FailMain.lean")
+    "import PkgB\ndef main : IO UInt32 := do\n  let _ := wrap 0\n  return 1\n"
+  let cfgPath := dir / "leancov.toml"
+  IO.FS.writeFile cfgPath "
+[leancov]
+out = \"out\"
+jobs = 2
+sort = \"cov\"
+top = 10
+html = true
+markdown = true
+exclude_instances = true
+
+[[package]]
+name = \"pkga\"
+pkg = \"PkgA\"
+src_dirs = [\"PkgA\"]
+prefix = \"PkgA\"
+
+[[package]]
+name = \"pkgb\"
+pkg = \"PkgB\"
+src_dirs = [\"PkgB\"]
+prefix = \"PkgB\"
+deps = [\"pkga=pkga\"]
+
+[[suite]]
+name = \"suite-ok\"
+package = \"pkga\"
+fast = true
+
+[[suite]]
+name = \"suite-fail\"
+package = \"pkgb\"
+fast = false
+"
+  checkEq "leancov test --list" (← LeanCov.CLI.runCLI ["test", "--config", cfgPath.toString, "--list"]) 0
+  checkEq "leancov test --report fails before sites.json" (← LeanCov.CLI.runCLI ["test", "--config", cfgPath.toString, "--report"]) 2
+  checkEq "leancov test --no-build fails before sites.json" (← LeanCov.CLI.runCLI ["test", "--config", cfgPath.toString, "--no-build"]) 2
+  checkEq "leancov test --clean --fast" (← LeanCov.CLI.runCLI [
+    "test", "--config", cfgPath.toString, "--clean", "--fast", "--leancov", "."
+  ]) 0
+  check "leancov test wrote html" (← (dir / "out" / "html" / "index.html").pathExists)
+  check "leancov test wrote markdown" (← (dir / "out" / "report.md").pathExists)
+  checkEq "leancov test --report subset" (← LeanCov.CLI.runCLI [
+    "test", "--config", cfgPath.toString, "--report", "--jobs", "2", "--sort", "cog", "--top", "5",
+    "--exclude-instances", "--min-cov", "0.0", "--max-crap", "100.0", "--max-cog-crap", "100.0", "suite-ok"
+  ]) 0
+  checkEq "leancov test --no-build suite-fail exits 1" (← LeanCov.CLI.runCLI [
+    "test", "--config", cfgPath.toString, "--no-build", "--leancov", ".", "suite-fail"
+  ]) 1
+  -- Parallel mutate (`--jobs 2`) + `--kinds` + CLI validation
+  let okSh := dir / "pass.sh"
+  IO.FS.writeFile okSh "#!/bin/sh\nexit 0\n"
+  let _ ← IO.Process.output { cmd := "chmod", args := #["+x", okSh.toString] }
+  checkEq "mutate --jobs 2 --kinds cmp,lit" (← LeanCov.CLI.runCLI [
+    "mutate", "--pkg", (dir / "PkgA").toString, "--file", "PkgA/Core.lean",
+    "--kinds", "cmp,lit", "--jobs", "2", "--no-build", "--", okSh.toString
+  ]) 0
+  checkEq "mutate --jobs 0 exits 2" (← LeanCov.CLI.runCLI ["mutate", "--jobs", "0"]) 2
+  checkEq "mutate --jobs abc exits 2" (← LeanCov.CLI.runCLI ["mutate", "--jobs", "abc"]) 2
+  checkEq "mutate --kinds bogus exits 2" (← LeanCov.CLI.runCLI ["mutate", "--kinds", "bogus"]) 2
+  checkEq "report --exclude-instances" (← LeanCov.CLI.runCLI [
+    "report", "--sites", (dir / "out" / "sites.json").toString,
+    "--profile-dir", (dir / "out" / "profiles").toString, "--exclude-instances", "--top", "5"
+  ]) 0
+  for badTestArgs in #[
+    ["test", "--bogus"],
+    ["test", "--config", (dir / "nope.toml").toString],
+    ["test", "--config", cfgPath.toString, "--jobs", "0"],
+    ["test", "--config", cfgPath.toString, "--jobs", "abc"],
+    ["test", "--config", cfgPath.toString, "--sort", "bogus"],
+    ["test", "--config", cfgPath.toString, "--top", "abc"],
+    ["test", "--config", cfgPath.toString, "--min-cov", "abc"],
+    ["test", "--config", cfgPath.toString, "--max-crap", "abc"],
+    ["test", "--config", cfgPath.toString, "--max-cog-crap", "abc"],
+    ["test", "--config", cfgPath.toString, "unknown-suite"]
+  ] do
+    checkEq s!"bad test args {badTestArgs}" (← LeanCov.CLI.runCLI badTestArgs) 2
+  let _ ← IO.Process.output { cmd := "rm", args := #["-rf", dir.toString] }
+
 unsafe def main : IO UInt32 :=
   runMain "leancov-test" do
     runTest "types & binary profiles" testTypesAndProfiles
@@ -2010,6 +2260,8 @@ unsafe def main : IO UInt32 :=
     runTest "report, kinds & LCOV" testReportAndLcov
     runTest "CLI subcommands end-to-end" testCLISubcommands
     runTest "v0.3.0 filtering, HTML & CAF CLI" testV030CLI
+    runTest "v0.4.0 while-true, instances, kinds & config" testV040Features
+    runTest "v0.4.0 leancov test & parallel mutate e2e" testConfigAndTestCLI
     runTest "fuzz primitives & mutator" testFuzzPrimitives
     runTest "exact binary runtime counters (ground truth)" testExactRuntimeCounters
     runTest "AST mutation engine & mutate CLI" testMutateEngineAndCLI

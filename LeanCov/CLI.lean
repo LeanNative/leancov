@@ -1,5 +1,6 @@
 import Lean.Data.Json
 import Std.Data.HashMap
+import Std.Sync.Mutex
 import LeanCov.Runtime
 import LeanCov.Cov
 
@@ -10,16 +11,17 @@ Subcommands:
 - `leancov stage`      — stage an entire Lake package into an out-of-tree instrumented build directory
 - `leancov run`        — execute a command with `LEAN_COV_FILE` / `LEAN_COV_SITES` initialized
 - `leancov merge`      — combine multiple `.cov` profiles into one merged `.cov` file
-- `leancov report`     — merge `.cov` profiles, print CRAP/Cognitive-CRAP/patch/hot summary, export JSON/LCOV/Markdown
+- `leancov report`     — merge `.cov` profiles, print CRAP/Cognitive-CRAP/patch/hot summary, export HTML/JSON/LCOV/Markdown
+- `leancov test`       — declarative multi-package test & coverage runner configured by `leancov.toml`
 - `leancov diff`       — compare two JSON coverage reports for CI regression gating
 - `leancov analyze`    — static McCabe CC and Cognitive Complexity report without running tests
-- `leancov mutate`     — AST-guided, coverage-pruned, proof-aware mutation testing in an isolated workspace -/
+- `leancov mutate`     — AST-guided, coverage-pruned, proof-aware mutation testing in isolated workspaces -/
 
 namespace LeanCov.CLI
 open Lean LeanCov.Cov
 
 /-- Package version printed by `leancov --version` / `-V`. -/
-def version : String := "0.3.0"
+def version : String := "0.4.0"
 
 private def usage : String :=
 "leancov — source-level Lean 4 coverage, McCabe CRAP, Cognitive Complexity, and AST Mutation Testing
@@ -36,17 +38,23 @@ Usage:
   leancov report     --sites <sites.json> (--profile <p.cov> | --profile-dir <dir>)...
                      [--json <out.json>] [--lcov <out.info>] [--markdown <out.md>] [--html <dir>] [--top <N>]
                      [--sort crap|cog|cc|uncov|cov] [--file <substr>]... [--decl <substr>]...
-                     [--exclude-kind <kind>]... [--files] [--kinds] [--missed]
+                     [--exclude-kind <kind>]... [--exclude-instances] [--files] [--kinds] [--missed]
                      [--missed-detail] [--src-root <dir>] [--hot]
                      [--git-diff <baseRef>] [--repo <dir>] [--min-patch-cov <pct>]
                      [--min-cov <pct>] [--max-crap <val>] [--max-cog-crap <val>]
+  leancov test       [--config <leancov.toml>] [--leancov <leancovDir>] [--fast] [--clean]
+                     [--no-build] [--report] [--list] [--jobs <N>]
+                     [--sort crap|cog|cc|uncov|cov] [--top <N>]
+                     [--html <dir>] [--markdown <out.md>] [--exclude-instances]
+                     [--min-cov <pct>] [--max-crap <val>] [--max-cog-crap <val>] [suite ...]
   leancov diff       --base <old.json> --head <new.json> [--top <N>]
                      [--json <out.json>] [--markdown <out.md>]
                      [--max-cov-drop <pct>] [--max-crap-delta <val>]
   leancov analyze    --src <dir> [--src ...] [--exclude <substr>]... [--imports <Mod1,Mod2>]...
                      [--json <out.json>] [--top <N>] [--sort cog|cc]
   leancov mutate     --pkg <pkgDir> [--out <workDir>] (--file <relFile> | --src-dir <relDir>)...
-                     [--filter <declSubstr>]... [--max-mutants <N>] [--seed <N>] [--timeout <sec>]
+                     [--filter <declSubstr>]... [--kinds <k1,k2>]... [--jobs <N>]
+                     [--max-mutants <N>] [--seed <N>] [--timeout <sec>]
                      [--build-target <lakeTarget>]... [--proof-target <lakeTarget>]... [--no-build]
                      [--sites <sites.json> (--profile <p.cov> | --profile-dir <dir>)...]
                      [--git-diff <baseRef>] [--no-arith] [--include-interp] [--imports <Mod1,Mod2>]...
@@ -516,7 +524,7 @@ private def runtimeOnlyLakefile : String :=
 open Lake DSL
 
 package «leancov» where
-  version := v!\"0.3.0\"
+  version := v!\"0.4.0\"
 
 target leancov_rt.o pkg : System.FilePath := do
   let oFile := pkg.buildDir / \"c\" / \"leancov_rt.o\"
@@ -719,6 +727,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
   let mut fileFilters : Array String := #[]
   let mut declFilters : Array String := #[]
   let mut excludeKinds : Array BranchKind := #[]
+  let mut excludeInstances : Bool := false
   let mut topN : Nat := 25
   let mut sortBy : SortKey := .crap
   let mut showFiles : Bool := false
@@ -752,6 +761,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
         | some k => excludeKinds := excludeKinds.push k
         | none => IO.eprintln s!"invalid --exclude-kind value: {kTok}"; return 2
       rest := tl
+    | "--exclude-instances" :: tl => excludeInstances := true; rest := tl
     | "--top" :: v :: tl =>
       match v.toNat? with
       | some n => topN := n; rest := tl
@@ -798,6 +808,7 @@ private def cmdReport (args : List String) : IO UInt32 := do
     files := fileFilters
     decls := declFilters
     excludeKinds := excludeKinds
+    excludeInstances := excludeInstances
   }
   let mEff := filterManifest m flt
   let rep := buildReport mEff hits
@@ -971,6 +982,8 @@ private structure MutateOpts where
   files : Array String := #[]
   srcDirs : Array String := #[]
   filters : Array String := #[]
+  kinds : Array MutantKind := #[]
+  jobs : Nat := 1
   maxMutants : Option Nat := none
   seed : Option UInt64 := none
   timeoutMs : Nat := 30000
@@ -1012,6 +1025,19 @@ private def parseMutateArgs : List String → MutateOpts → IO (Except String M
   | "--file" :: v :: tl, o => parseMutateArgs tl { o with files := o.files.push v }
   | "--src-dir" :: v :: tl, o => parseMutateArgs tl { o with srcDirs := o.srcDirs.push v }
   | "--filter" :: v :: tl, o => parseMutateArgs tl { o with filters := o.filters ++ splitCommaNonEmpty v }
+  | "--kinds" :: v :: tl, o => do
+    let mut ks := o.kinds
+    for tok in splitCommaNonEmpty v do
+      match MutantKind.ofAlias? tok with
+      | some k => ks := ks.push k
+      | none => return .error s!"invalid --kinds value: {tok} (use cmp|arith|bool|lit|neg|cond)"
+    parseMutateArgs tl { o with kinds := ks }
+  | "--jobs" :: v :: tl, o =>
+    match v.toNat? with
+    | some n =>
+      if n ≥ 1 then parseMutateArgs tl { o with jobs := n }
+      else pure (.error s!"--jobs must be >= 1: {v}")
+    | none => pure (.error s!"invalid --jobs value: {v}")
   | "--max-mutants" :: v :: tl, o =>
     match v.toNat? with
     | some n => parseMutateArgs tl { o with maxMutants := some n }
@@ -1185,6 +1211,7 @@ private unsafe def cmdMutate (args : List String) : IO UInt32 := do
     origByFile := origByFile.insert rel src
     let ms ← discoverMutantsInSource env rel src allMutants.size opts.filters opts.includeArith opts.includeInterp
     allMutants := allMutants ++ ms
+  allMutants := filterMutantsByKinds allMutants opts.kinds
   if let some ref := opts.gitDiffRef then
     match ← collectGitChangedLines pkgAbs ref with
     | .error e => IO.eprintln s!"mutate: {e}"; return 2
@@ -1215,6 +1242,7 @@ private unsafe def cmdMutate (args : List String) : IO UInt32 := do
     testCmd := rawCmd
     testArgs := cmdRest.toArray
     timeoutMs := opts.timeoutMs
+    jobs := opts.jobs
   }
   let res ← try
     executeMutants cfg origByFile discovered selected (resolveMutateTestCmd callerCwd pkgAbs workAbs rawCmd) preUncovered
@@ -1238,6 +1266,248 @@ private unsafe def cmdMutate (args : List String) : IO UInt32 := do
       return 1
   return 0
 
+private structure TestOpts where
+  configPath : System.FilePath := "leancov.toml"
+  leancovDir : Option System.FilePath := none
+  fastMode : Bool := false
+  cleanMode : Bool := false
+  noBuild : Bool := false
+  reportOnly : Bool := false
+  listOnly : Bool := false
+  jobs? : Option Nat := none
+  sort? : Option SortKey := none
+  top? : Option Nat := none
+  htmlDir? : Option System.FilePath := none
+  mdFile? : Option System.FilePath := none
+  excludeInstances : Bool := false
+  minCov? : Option Float := none
+  maxCrap? : Option Float := none
+  maxCogCrap? : Option Float := none
+  suites : Array String := #[]
+  deriving Inhabited
+
+private def parseTestArgs : List String → TestOpts → Except String TestOpts
+  | [], o => pure o
+  | "--config" :: v :: tl, o => parseTestArgs tl { o with configPath := ⟨v⟩ }
+  | "--leancov" :: v :: tl, o => parseTestArgs tl { o with leancovDir := some ⟨v⟩ }
+  | "--fast" :: tl, o => parseTestArgs tl { o with fastMode := true }
+  | "--clean" :: tl, o => parseTestArgs tl { o with cleanMode := true }
+  | "--no-build" :: tl, o => parseTestArgs tl { o with noBuild := true }
+  | "--report" :: tl, o => parseTestArgs tl { o with reportOnly := true }
+  | "--list" :: tl, o => parseTestArgs tl { o with listOnly := true }
+  | "--jobs" :: v :: tl, o =>
+    match v.toNat? with
+    | some n => if n ≥ 1 then parseTestArgs tl { o with jobs? := some n } else throw s!"--jobs must be >= 1: {v}"
+    | none => throw s!"invalid --jobs value: {v}"
+  | "--sort" :: v :: tl, o =>
+    match SortKey.ofString? v with
+    | some k => parseTestArgs tl { o with sort? := some k }
+    | none => throw s!"invalid --sort value: {v}"
+  | "--top" :: v :: tl, o =>
+    match v.toNat? with
+    | some n => parseTestArgs tl { o with top? := some n }
+    | none => throw s!"invalid --top value: {v}"
+  | "--html" :: v :: tl, o => parseTestArgs tl { o with htmlDir? := some ⟨v⟩ }
+  | "--markdown" :: v :: tl, o => parseTestArgs tl { o with mdFile? := some ⟨v⟩ }
+  | "--exclude-instances" :: tl, o => parseTestArgs tl { o with excludeInstances := true }
+  | "--min-cov" :: v :: tl, o =>
+    match parseFloat? v with
+    | some f => parseTestArgs tl { o with minCov? := some f }
+    | none => throw s!"invalid --min-cov value: {v}"
+  | "--max-crap" :: v :: tl, o =>
+    match parseFloat? v with
+    | some f => parseTestArgs tl { o with maxCrap? := some f }
+    | none => throw s!"invalid --max-crap value: {v}"
+  | "--max-cog-crap" :: v :: tl, o =>
+    match parseFloat? v with
+    | some f => parseTestArgs tl { o with maxCogCrap? := some f }
+    | none => throw s!"invalid --max-cog-crap value: {v}"
+  | tok :: tl, o =>
+    if tok.startsWith "-" then throw s!"unknown option for test: {tok}"
+    else parseTestArgs tl { o with suites := o.suites.push tok }
+
+private def resolveFromRoot (root : System.FilePath) (raw : String) : System.FilePath :=
+  let p : System.FilePath := ⟨raw⟩
+  if p.isAbsolute then p else root / p
+
+private def runSuiteWorker (outDir rootDir : System.FilePath) (cfg : ProjectConfig)
+    (armOnMain : Bool) (siteCount : Nat)
+    (queueRef : Std.Mutex (List SuiteConfig)) (printMutex : Std.Mutex Unit) :
+    IO (Array (String × UInt32)) := do
+  let profilesDir := outDir / "profiles"
+  let logsDir := outDir / "logs"
+  let mut out : Array (String × UInt32) := #[]
+  repeat
+    let next? ← queueRef.atomically do
+      match ← get with
+      | [] => return none
+      | s :: rest => set rest; return some s
+    let some s := next? | break
+    let profPath := profilesDir / s!"{s.name}.cov"
+    initProfile profPath siteCount
+    let mut envVars : Array (String × Option String) := #[
+      ("LEAN_COV_FILE", some profPath.toString),
+      ("LEAN_COV_SITES", some (toString siteCount))
+    ]
+    if armOnMain then envVars := envVars.push ("LEAN_COV_DEFER_INIT", some "1")
+    let pkgCwd := match s.cwd with
+      | some c => resolveFromRoot rootDir c
+      | none =>
+        let pRel := (cfg.packages.find? (·.name == s.package)).map (·.pkg) |>.getD "."
+        resolveFromRoot rootDir pRel
+    let binPath := outDir / s.package / ".lake" / "build" / "bin" / s.target
+    let proc ← IO.Process.output {
+      cmd := binPath.toString
+      args := s.args
+      cwd := some pkgCwd
+      env := envVars
+    }
+    IO.FS.writeFile (logsDir / s!"{s.name}.log") (proc.stdout ++ proc.stderr)
+    printMutex.atomically do
+      let mark := if proc.exitCode == 0 then "ok  " else "FAIL"
+      IO.println s!"  {mark} {s.name} (exit {proc.exitCode})"
+    out := out.push (s.name, proc.exitCode)
+  return out
+
+/-- Run `leancov test`: declarative multi-package staging, parallel execution, and reporting from `leancov.toml`. -/
+private unsafe def cmdTest (args : List String) : IO UInt32 := do
+  let opts ← match parseTestArgs args {} with
+    | .ok o => pure o
+    | .error e => IO.eprintln e; return 2
+  unless ← opts.configPath.pathExists do
+    IO.eprintln s!"test: config file not found: {opts.configPath}"
+    return 2
+  let cfg ← match parseProjectConfig (← IO.FS.readFile opts.configPath) with
+    | .ok c => pure c
+    | .error e => IO.eprintln s!"test: {opts.configPath}: {e}"; return 2
+  if opts.listOnly then
+    for s in cfg.suites do
+      let tier := if s.fast then "fast" else "full"
+      IO.println s!"  {s.name}  ({s.package}:{s.target}, {tier})"
+    return 0
+  let mut selected : Array SuiteConfig := #[]
+  if !opts.suites.isEmpty then
+    for nm in opts.suites do
+      match cfg.suites.find? (·.name == nm) with
+      | some s => selected := selected.push s
+      | none => IO.eprintln s!"test: unknown suite '{nm}'"; return 2
+  else
+    selected := if opts.fastMode then cfg.suites.filter (·.fast) else cfg.suites
+  if selected.isEmpty then
+    IO.eprintln "test: no suites selected to run"
+    return 2
+
+  let cfgAbs ← canonicalOrAbs opts.configPath
+  let rootDir := cfgAbs.parent.getD ⟨"."⟩
+  let outDir := resolveFromRoot rootDir cfg.out
+  let sitesPath := outDir / "sites.json"
+  let profilesDir := outDir / "profiles"
+  let logsDir := outDir / "logs"
+
+  let mut failedSuites : Array String := #[]
+  unless opts.reportOnly do
+    if opts.cleanMode then
+      let _ ← IO.Process.output { cmd := "rm", args := #["-rf", outDir.toString] }
+    unless opts.noBuild do
+      if ← sitesPath.pathExists then
+        let _ ← IO.Process.output { cmd := "rm", args := #["-f", sitesPath.toString] }
+      for idx in [:cfg.packages.size] do
+        let p := cfg.packages[idx]!
+        let mut stArgs : List String := [
+          "--pkg", (resolveFromRoot rootDir p.pkg).toString,
+          "--out", (outDir / p.name).toString,
+          "--sites", sitesPath.toString
+        ]
+        if let some ld := opts.leancovDir then stArgs := stArgs ++ ["--leancov", ld.toString]
+        if idx > 0 then stArgs := stArgs ++ ["--append-sites"]
+        if !p.pathPrefix.isEmpty then stArgs := stArgs ++ ["--prefix", p.pathPrefix]
+        for sd in p.srcDirs do stArgs := stArgs ++ ["--src-dir", sd]
+        for ex in p.exclude do stArgs := stArgs ++ ["--exclude", ex]
+        for imp in p.imports do stArgs := stArgs ++ ["--imports", imp]
+        for d in p.deps do
+          let depVal := match d.splitOn "=" with
+            | [dn, dv] =>
+              if cfg.packages.any (·.name == dv) then s!"{dn}={outDir / dv}"
+              else s!"{dn}={resolveFromRoot rootDir dv}"
+            | _ => d
+          stArgs := stArgs ++ ["--dep", depVal]
+        if !p.boolOps then stArgs := stArgs ++ ["--no-bool-ops"]
+        if p.includeCafs then stArgs := stArgs ++ ["--include-cafs"]
+        let stCode ← cmdStage stArgs
+        if stCode != 0 then return stCode
+      for p in cfg.packages do
+        let mut targets : Array String := #[]
+        for s in selected do
+          if s.package == p.name && !targets.contains s.target then
+            targets := targets.push s.target
+        if !targets.isEmpty then
+          IO.println s!"Building {p.name} target(s): {", ".intercalate targets.toList}"
+          let bOut ← IO.Process.output {
+            cmd := "lake"
+            args := #["build"] ++ targets
+            cwd := some (outDir / p.name)
+          }
+          if bOut.exitCode != 0 then
+            IO.eprintln s!"test: lake build failed in {outDir / p.name}:\n{bOut.stdout}{bOut.stderr}"
+            return 1
+    unless ← sitesPath.pathExists do
+      IO.eprintln s!"test: {sitesPath} not found; run without --no-build first"
+      return 2
+    let m ← readManifest sitesPath
+    if opts.suites.isEmpty && !opts.fastMode then
+      let _ ← IO.Process.output { cmd := "rm", args := #["-rf", profilesDir.toString, logsDir.toString] }
+    IO.FS.createDirAll profilesDir
+    IO.FS.createDirAll logsDir
+    let jobs := max 1 (opts.jobs?.getD cfg.jobs)
+    let nWorkers := min jobs selected.size
+    IO.println s!"Running {selected.size} suite(s) with {nWorkers} worker(s)..."
+    LeanCov.raiseStack ()
+    let queueRef ← Std.Mutex.new selected.toList
+    let printMutex ← Std.Mutex.new ()
+    let mut tasks : Array (Task (Except IO.Error (Array (String × UInt32)))) := #[]
+    for _ in [:nWorkers] do
+      let t ← IO.asTask (prio := .dedicated) (runSuiteWorker outDir rootDir cfg m.armOnMain m.sites.size queueRef printMutex)
+      tasks := tasks.push t
+    for t in tasks do
+      let res ← IO.ofExcept (← IO.wait t)
+      for (sn, code) in res do
+        if code != 0 then failedSuites := failedSuites.push sn
+
+  unless ← sitesPath.pathExists do
+    IO.eprintln s!"test: {sitesPath} not found; run suites first"
+    return 2
+
+  let subsetReport := opts.reportOnly && (!opts.suites.isEmpty || opts.fastMode)
+  let mut repArgs : List String := ["--sites", sitesPath.toString]
+  if subsetReport then
+    for s in selected do
+      repArgs := repArgs ++ ["--profile", (profilesDir / s!"{s.name}.cov").toString]
+  else
+    repArgs := repArgs ++ ["--profile-dir", profilesDir.toString]
+  repArgs := repArgs ++ [
+    "--json", (outDir / "coverage.json").toString,
+    "--lcov", (outDir / "lcov.info").toString,
+    "--sort", (opts.sort?.getD cfg.sort).toString,
+    "--top", toString (opts.top?.getD cfg.top),
+    "--src-root", rootDir.toString
+  ]
+  if cfg.files then repArgs := repArgs ++ ["--files"]
+  if cfg.kinds then repArgs := repArgs ++ ["--kinds"]
+  if opts.excludeInstances || cfg.excludeInstances then repArgs := repArgs ++ ["--exclude-instances"]
+  for ek in cfg.excludeKinds do repArgs := repArgs ++ ["--exclude-kind", ek.toString]
+  if let some hd := opts.htmlDir? then repArgs := repArgs ++ ["--html", hd.toString]
+  else if cfg.html then repArgs := repArgs ++ ["--html", (outDir / "html").toString]
+  if let some md := opts.mdFile? then repArgs := repArgs ++ ["--markdown", md.toString]
+  else if cfg.markdown then repArgs := repArgs ++ ["--markdown", (outDir / "report.md").toString]
+  if let some mc := opts.minCov?.orElse (fun _ => cfg.minCov) then repArgs := repArgs ++ ["--min-cov", toString mc]
+  if let some xc := opts.maxCrap?.orElse (fun _ => cfg.maxCrap) then repArgs := repArgs ++ ["--max-crap", toString xc]
+  if let some xg := opts.maxCogCrap?.orElse (fun _ => cfg.maxCogCrap) then repArgs := repArgs ++ ["--max-cog-crap", toString xg]
+  let repCode ← cmdReport repArgs
+  if !failedSuites.isEmpty then
+    IO.eprintln s!"test: failed suite(s): {", ".intercalate failedSuites.toList} (logs in {logsDir})"
+    return 1
+  return repCode
+
 unsafe def runCLI (args : List String) : IO UInt32 := do
   match args with
   | "instrument" :: rest => cmdInstrument rest
@@ -1245,6 +1515,7 @@ unsafe def runCLI (args : List String) : IO UInt32 := do
   | "run" :: rest => cmdRun rest
   | "merge" :: rest => cmdMerge rest
   | "report" :: rest => cmdReport rest
+  | "test" :: rest => cmdTest rest
   | "diff" :: rest => cmdDiff rest
   | "analyze" :: rest => cmdAnalyze rest
   | "mutate" :: rest => cmdMutate rest

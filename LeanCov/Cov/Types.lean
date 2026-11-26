@@ -93,7 +93,21 @@ structure FuncInfo where
   cc : Nat
   cognitive : Nat
   siteIds : Array Nat := #[]
-  deriving Repr, BEq, Inhabited, ToJson, FromJson
+  isInstance : Bool := false
+  deriving Repr, BEq, Inhabited, ToJson
+
+instance : FromJson FuncInfo where
+  fromJson? j := do
+    let name ← j.getObjValAs? String "name"
+    let file ← j.getObjValAs? String "file"
+    let line ← j.getObjValAs? Nat "line"
+    let endLine ← j.getObjValAs? Nat "endLine"
+    let lines ← j.getObjValAs? Nat "lines"
+    let cc ← j.getObjValAs? Nat "cc"
+    let cognitive ← j.getObjValAs? Nat "cognitive"
+    let siteIds := (j.getObjValAs? (Array Nat) "siteIds").toOption.getD #[]
+    let isInstance := (j.getObjValAs? Bool "isInstance").toOption.getD false
+    pure { name, file, line, endLine, lines, cc, cognitive, siteIds, isInstance }
 
 /-- Instrumentation manifest (`sites.json`) linking binary counter indices to Lean source locations. -/
 structure Manifest where

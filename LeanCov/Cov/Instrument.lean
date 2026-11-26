@@ -378,6 +378,18 @@ private def isStaticallyNonEmptyFor (stx : Syntax) : Bool :=
     !decls.isEmpty && decls.all fun d =>
       d.getNumArgs > 0 && isStaticallyNonEmptyColl (d.getArg (d.getNumArgs - 1))
 
+private def isStaticallyTrueWhile (stx : Syntax) : Bool :=
+  if stx.getKind != `Lean.Parser.Term.doWhile || stx.getNumArgs < 2 then false
+  else
+    let condNode := stx.getArg 1
+    let cond :=
+      if condNode.getKind == `Lean.Parser.Term.doIfProp && condNode.getNumArgs ≥ 2 then
+        condNode.getArg 1
+      else condNode
+    match unwrapParen cond with
+    | .ident _ _ n _ => n == `true || n == `Bool.true
+    | _ => false
+
 mutual
 
 private partial def walkTermIf (k : SyntaxNodeKind) (args : Array Syntax) (nesting : Nat) : InstM Unit := do
@@ -481,7 +493,7 @@ private partial def walkDoLoop (stx : Syntax) (args : Array Syntax) (nesting : N
       | none => pure false
     unless loopIgnored do
       let trackSkip ←
-        if isStaticallyNonEmptyFor stx then pure false
+        if isStaticallyNonEmptyFor stx || isStaticallyTrueWhile stx then pure false
         else match stx.getPos?, stx.getTailPos? with
           | some la, some _ => isLineStart la.byteIdx
           | _, _ => pure false
@@ -829,6 +841,7 @@ private def instrumentDecl (ns : List String) (cmd : Syntax) (mods inner : Synta
     cc := comp.cc
     cognitive := comp.cognitive
     siteIds := siteIds
+    isInstance := inner.getKind == `Lean.Parser.Command.instance
   }
 
 private def identParts (s : Syntax) : List String :=

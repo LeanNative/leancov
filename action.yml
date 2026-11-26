@@ -1,0 +1,137 @@
+name: "LeanCov Coverage & Quality Gates"
+description: "Install LeanCov and run source-level Lean 4 coverage, complexity, and HTML/Markdown reporting."
+
+inputs:
+  version:
+    description: "LeanCov release tag (e.g. v0.4.0)"
+    required: false
+    default: "v0.4.0"
+  config:
+    description: "Path to leancov.toml configuration file"
+    required: false
+    default: "leancov.toml"
+  args:
+    description: "Extra arguments passed to `leancov test`"
+    required: false
+    default: ""
+  min-cov:
+    description: "Minimum branch coverage percentage gate"
+    required: false
+    default: ""
+  max-crap:
+    description: "Maximum allowed McCabe CRAP score"
+    required: false
+    default: ""
+  max-cog-crap:
+    description: "Maximum allowed Cognitive CRAP score"
+    required: false
+    default: ""
+  upload-html:
+    description: "Upload standalone HTML report as a workflow artifact"
+    required: false
+    default: "true"
+  step-summary:
+    description: "Append Markdown report to GITHUB_STEP_SUMMARY"
+    required: false
+    default: "true"
+  comment-pr:
+    description: "Post Markdown coverage summary as a PR comment (requires pull-requests: write)"
+    required: false
+    default: "false"
+
+outputs:
+  out-dir:
+    description: "Output directory used by `leancov test`"
+    value: ${{ steps.run.outputs.out_dir }}
+  json:
+    description: "Path to generated JSON coverage report"
+    value: ${{ steps.run.outputs.json }}
+  lcov:
+    description: "Path to generated LCOV report"
+    value: ${{ steps.run.outputs.lcov }}
+  markdown:
+    description: "Path to generated Markdown summary"
+    value: ${{ steps.run.outputs.markdown }}
+  html:
+    description: "Path to generated standalone HTML report directory"
+    value: ${{ steps.run.outputs.html }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install LeanCov ${{ inputs.version }}
+      id: install
+      shell: bash
+      run: |
+        set -euo pipefail
+        OS="$(uname -s)"
+        case "$OS" in
+          Darwin) TARGET="macos-arm64" ;;
+          Linux)  TARGET="linux-x86_64" ;;
+          *) echo "Unsupported OS: $OS" >&2; exit 1 ;;
+        esac
+        INSTALL_DIR="${RUNNER_TEMP}/leancov-${{ inputs.version }}"
+        rm -rf "$INSTALL_DIR"
+        mkdir -p "$INSTALL_DIR"
+        URL="https://github.com/LeanNative/leancov/releases/download/${{ inputs.version }}/leancov-${{ inputs.version }}-${TARGET}.tar.gz"
+        if curl -fsSL "$URL" -o "${RUNNER_TEMP}/leancov.tar.gz"; then
+          tar -xzf "${RUNNER_TEMP}/leancov.tar.gz" -C "$INSTALL_DIR"
+          rm -f "${RUNNER_TEMP}/leancov.tar.gz"
+          LEANCOV_ROOT="$INSTALL_DIR/leancov"
+          BIN="$LEANCOV_ROOT/bin/leancov"
+        else
+          echo "Release tarball not found at $URL; building from source..."
+          git clone --depth 1 --branch "${{ inputs.version }}" https://github.com/LeanNative/leancov.git "$INSTALL_DIR/src"
+          (cd "$INSTALL_DIR/src" && lake build leancov)
+          LEANCOV_ROOT="$INSTALL_DIR/src"
+          BIN="$LEANCOV_ROOT/.lake/build/bin/leancov"
+        fi
+        chmod +x "$BIN"
+        echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+        echo "root=$LEANCOV_ROOT" >> "$GITHUB_OUTPUT"
+
+    - name: Run LeanCov test & coverage
+      id: run
+      shell: bash
+      run: |
+        set -euo pipefail
+        CFG="${{ inputs.config }}"
+        OUT_DIR="$(python3 -c 'import pathlib,re,sys; t=pathlib.Path(sys.argv[1]).read_text(); m=re.search(r"(?m)^\s*out\s*=\s*\"([^\"]+)\"", t); print(m.group(1) if m else "build/leancov")' "$CFG")"
+        HTML_DIR="${OUT_DIR}/html"
+        MD_FILE="${OUT_DIR}/report.md"
+        CMD=("${{ steps.install.outputs.bin }}" "test" "--config" "$CFG" "--leancov" "${{ steps.install.outputs.root }}" "--html" "$HTML_DIR" "--markdown" "$MD_FILE")
+        if [ -n "${{ inputs.min-cov }}" ]; then CMD+=("--min-cov" "${{ inputs.min-cov }}"); fi
+        if [ -n "${{ inputs.max-crap }}" ]; then CMD+=("--max-crap" "${{ inputs.max-crap }}"); fi
+        if [ -n "${{ inputs.max-cog-crap }}" ]; then CMD+=("--max-cog-crap" "${{ inputs.max-cog-crap }}"); fi
+        if [ -n "${{ inputs.args }}" ]; then
+          read -r -a EXTRA <<< "${{ inputs.args }}"
+          CMD+=("${EXTRA[@]}")
+        fi
+        echo "out_dir=${OUT_DIR}" >> "$GITHUB_OUTPUT"
+        echo "json=${OUT_DIR}/coverage.json" >> "$GITHUB_OUTPUT"
+        echo "lcov=${OUT_DIR}/lcov.info" >> "$GITHUB_OUTPUT"
+        echo "markdown=${MD_FILE}" >> "$GITHUB_OUTPUT"
+        echo "html=${HTML_DIR}" >> "$GITHUB_OUTPUT"
+
+        set +e
+        "${CMD[@]}"
+        STATUS=$?
+        set -e
+
+        if [ "${{ inputs.step-summary }}" = "true" ] && [ -f "$MD_FILE" ]; then
+          cat "$MD_FILE" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        if [ "${{ inputs.comment-pr }}" = "true" ] && [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ] && [ -f "$MD_FILE" ]; then
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file "$MD_FILE" || true
+        fi
+        exit "$STATUS"
+      env:
+        GH_TOKEN: ${{ github.token }}
+
+    - name: Upload HTML coverage report
+      if: ${{ always() && inputs.upload-html == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: leancov-html-report
+        path: ${{ steps.run.outputs.html }}
+        if-no-files-found: ignore

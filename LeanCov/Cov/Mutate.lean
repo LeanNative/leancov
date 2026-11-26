@@ -1,6 +1,7 @@
 import Lean
 import Lean.Data.Json
 import Std.Data.HashMap
+import Std.Sync.Mutex
 import LeanCov.Cov.Types
 import LeanCov.Cov.Instrument
 
@@ -39,6 +40,15 @@ def MutantKind.ofString? : String → Option MutantKind
   | "neg.remove" => some .negRemove
   | "cond.negate" => some .condNegate
   | _ => none
+
+def MutantKind.ofAlias? : String → Option MutantKind
+  | "cmp" => some .cmpFlip
+  | "arith" => some .arithFlip
+  | "bool" => some .boolOpFlip
+  | "lit" => some .boolLitFlip
+  | "neg" => some .negRemove
+  | "cond" => some .condNegate
+  | s => MutantKind.ofString? s
 
 instance : ToJson MutantKind := ⟨fun k => Json.str k.toString⟩
 instance : FromJson MutantKind where
@@ -494,6 +504,12 @@ structure MutateRunConfig where
   testCmd : String
   testArgs : Array String := #[]
   timeoutMs : Nat := 30000
+  jobs : Nat := 1
+
+/-- Restrict mutants to those matching `kinds` (all kept when `kinds` is empty). -/
+def filterMutantsByKinds (ms : Array Mutant) (kinds : Array MutantKind) : Array Mutant :=
+  if kinds.isEmpty then ms
+  else (ms.filter fun m => kinds.contains m.kind).mapIdx fun i m => { m with id := i }
 
 private def runLakeBuildTargets (workDir : System.FilePath) (targets : Array String) : IO (UInt32 × String) := do
   let out ← IO.Process.output {
@@ -622,6 +638,25 @@ def summarizeMutateResults (discovered : Nat) (results : Array MutantResult) : M
     score, results
   }
 
+private def rewriteCmdForWorker (baseWork workerWork : System.FilePath) (cmd : String) : String :=
+  let b := baseWork.toString
+  if cmd == b || cmd.startsWith (b ++ "/") then
+    workerWork.toString ++ (cmd.drop b.length).toString
+  else cmd
+
+private def outcomeTag (o : MutantOutcome) : String :=
+  match o with
+  | .killed => "KILLED      "
+  | .proved => "PROVED      "
+  | .survived => "SURVIVED    "
+  | .timeout => "TIMEOUT     "
+  | .uncompilable => "UNCOMPILABLE"
+  | .uncovered => "UNCOVERED   "
+
+private def removeDirs (dirs : Array System.FilePath) : IO Unit := do
+  for d in dirs do
+    let _ ← IO.Process.output { cmd := "rm", args := #["-rf", d.toString] }
+
 /-- Execute baseline verification (`lake build`, proof targets, and `testCmd`) and evaluate every mutant in `selected`. -/
 def executeMutants (cfg : MutateRunConfig) (origByFile : Std.HashMap String String)
     (discovered : Nat) (selected : Array Mutant)
@@ -644,19 +679,67 @@ def executeMutants (cfg : MutateRunConfig) (origByFile : Std.HashMap String Stri
     if code != 0 then
       return .error s!"mutate: baseline test command failed with exit code {code} before any mutation"
   let mut results : Array MutantResult := preResults
+  if cfg.jobs ≤ 1 || selected.size ≤ 1 then
+    for i in [:selected.size] do
+      let m := selected[i]!
+      let origSrc := origByFile.getD m.file ""
+      let res ← evalOneMutant runCfg origSrc m
+      IO.println s!"  [{i + 1}/{selected.size}] {outcomeTag res.outcome} {m.file}:{m.line} ({m.decl}) `{m.original}` -> `{m.replacement}` ({res.elapsedMs}ms)"
+      results := results.push res
+    return .ok (summarizeMutateResults discovered results)
+
+  let nWorkers := min cfg.jobs selected.size
+  let mut workerDirs : Array System.FilePath := Array.mkEmpty nWorkers
+  for w in [:nWorkers] do
+    let wDir : System.FilePath := ⟨s!"{cfg.workDir}_w{w}"⟩
+    let _ ← IO.Process.output { cmd := "rm", args := #["-rf", wDir.toString] }
+    let cpOut ← IO.Process.output { cmd := "cp", args := #["-Rp", cfg.workDir.toString, wDir.toString] }
+    if cpOut.exitCode != 0 then
+      removeDirs workerDirs
+      return .error s!"mutate: failed to clone worker workspace {wDir}: {cpOut.stderr}"
+    workerDirs := workerDirs.push wDir
+
+  let mut shards : Array (Array (Nat × Mutant)) := Array.replicate nWorkers #[]
   for i in [:selected.size] do
-    let m := selected[i]!
-    let origSrc := origByFile.getD m.file ""
-    let res ← evalOneMutant runCfg origSrc m
-    let tag := match res.outcome with
-      | .killed => "KILLED      "
-      | .proved => "PROVED      "
-      | .survived => "SURVIVED    "
-      | .timeout => "TIMEOUT     "
-      | .uncompilable => "UNCOMPILABLE"
-      | .uncovered => "UNCOVERED   "
-    IO.println s!"  [{i + 1}/{selected.size}] {tag} {m.file}:{m.line} ({m.decl}) `{m.original}` -> `{m.replacement}` ({res.elapsedMs}ms)"
-    results := results.push res
+    let w := i % nWorkers
+    shards := shards.set! w (shards[w]!.push (i, selected[i]!))
+
+  let logMutex ← Std.Mutex.new (0 : Nat)
+  let total := selected.size
+  let collected ← try
+    let mut tasks : Array (Task (Except IO.Error (Array (Nat × MutantResult)))) := #[]
+    for w in [:nWorkers] do
+      let wDir := workerDirs[w]!
+      let wShard := shards[w]!
+      let wCfg := { runCfg with
+        workDir := wDir
+        testCmd := rewriteCmdForWorker cfg.workDir wDir runCfg.testCmd
+      }
+      let t ← IO.asTask (prio := .dedicated) do
+        let mut out : Array (Nat × MutantResult) := Array.mkEmpty wShard.size
+        for (origIdx, m) in wShard do
+          let origSrc := origByFile.getD m.file ""
+          let res ← evalOneMutant wCfg origSrc m
+          logMutex.atomically do
+            let done ← get
+            let done' := done + 1
+            set done'
+            IO.println s!"  [{done'}/{total}] {outcomeTag res.outcome} {m.file}:{m.line} ({m.decl}) `{m.original}` -> `{m.replacement}` ({res.elapsedMs}ms)"
+          out := out.push (origIdx, res)
+        return out
+      tasks := tasks.push t
+    let mut flat : Array (Nat × MutantResult) := #[]
+    for t in tasks do
+      let shardRes ← IO.ofExcept (← IO.wait t)
+      flat := flat ++ shardRes
+    pure flat
+  catch e =>
+    removeDirs workerDirs
+    throw e
+  removeDirs workerDirs
+  let sorted := collected.qsort fun a b => a.1 < b.1
+  for (_, r) in sorted do
+    results := results.push r
   return .ok (summarizeMutateResults discovered results)
 
 private def round1Mut (x : Float) : String :=

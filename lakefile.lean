@@ -2,7 +2,7 @@ import Lake
 open Lake DSL
 
 package «leancov» where
-  version := v!"0.3.0"
+  version := v!"0.4.0"
 
 target leancov_rt.o pkg : System.FilePath := do
   let oFile := pkg.buildDir / "c" / "leancov_rt.o"

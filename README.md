@@ -28,7 +28,7 @@ Unlike C-level (`clang -fprofile-instr-generate`) coverage over Lean's generated
 | `LeanCov.Runtime` | `@[extern]` probe primitives & fuzz feedback backed by `c/leancov_rt.c` (`libleancov_rt`) | None |
 | `LeanCov.DoSyntax` | Eager `leancov_hit%` (`doElem`) and `leancov_term%` (`term`) elaborators | Meta-only (`public meta import Lean.Elab.Do`) |
 | `LeanCov.Cov` | AST complexity analyzer, byte-offset instrumenter, AST mutator, binary `.cov` I/O, diff/patch/hot JSON, Markdown & LCOV reporter | Compiler/CLI only |
-| `leancov` CLI | Standalone CLI (`stage`, `instrument`, `run`, `merge`, `report`, `diff`, `analyze`, `mutate`, `--version`) | CLI binary |
+| `leancov` CLI | Standalone CLI (`test`, `stage`, `instrument`, `run`, `merge`, `report`, `diff`, `analyze`, `mutate`, `--version`) | CLI binary |
 
 ## Installation
 
@@ -70,9 +70,9 @@ lake build leancov
 lake exe leancov --version
 ```
 
-### 2. Install the Standalone `leancov` CLI on `PATH`
+### 2. Install Prebuilt Release Binary or Standalone `leancov` CLI on `PATH`
 
-If you want to run `leancov` across any Lean project without adding it to every `lakefile`:
+Prebuilt standalone bundles (`leancov-<tag>-macos-arm64.tar.gz`, `leancov-<tag>-linux-x86_64.tar.gz`) are published on [GitHub Releases](https://github.com/LeanNative/leancov/releases), or you can build from source:
 
 ```sh
 git clone https://github.com/LeanNative/leancov
@@ -87,7 +87,7 @@ ln -sf "$(pwd)/.lake/build/bin/leancov" ~/.local/bin/leancov
 export PATH="$(pwd)/.lake/build/bin:$PATH"
 
 # Verify installation
-leancov --version   # prints: leancov 0.3.0
+leancov --version   # prints: leancov 0.4.0
 ```
 
 > **Note on toolchain lookup:** `leancov` walks up from its resolved executable path to find its own `lean-toolchain` and Lean sysroot, so symlinking `.lake/build/bin/leancov` works from any working directory. If you copy the binary out of the checkout, set `LEAN_SYSROOT="$(lean --print-prefix)"`.
@@ -179,9 +179,57 @@ leancov diff \
   --max-cov-drop 1.0 --max-crap-delta 5.0
 ```
 
-Sort modes: `--sort crap` (McCabe CRAP, default), `--sort cog` (Cognitive CRAP), `--sort cc` (McCabe CC), `--sort uncov` (uncovered branch count), or `--sort cov` (lowest coverage first). Open `build/leancov-stage/html/index.html` directly in a browser (zero dependencies) or generate HTML from LCOV with `genhtml`.
+Sort modes: `--sort crap` (McCabe CRAP, default), `--sort cog` (Cognitive CRAP), `--sort cc` (McCabe CC), `--sort uncov` (uncovered branch count), or `--sort cov` (lowest coverage first). Pass `--exclude-instances` to inspect core logic separately from typeclass `instance` boilerplate. Open `build/leancov-stage/html/index.html` directly in a browser (zero dependencies) or generate HTML from LCOV with `genhtml`.
 
-### 5. AST-Guided, Coverage-Pruned & Proof-Aware Mutation Testing (`mutate`)
+### 5. Declarative Multi-Package Runner (`leancov.toml` + `leancov test`)
+
+Instead of maintaining per-repo shell or Python runner scripts, declare packages and suites in `leancov.toml`:
+
+```toml
+[leancov]
+out = "build/leancov"
+jobs = 4
+sort = "cog"
+top = 20
+html = true
+markdown = true
+min_cov = 75.0
+
+[[package]]
+name = "core"
+pkg = "Core"
+src_dirs = ["Core"]
+prefix = "Core"
+exclude = ["Proofs/", "Test.lean"]
+
+[[package]]
+name = "app"
+pkg = "App"
+src_dirs = ["App"]
+prefix = "App"
+deps = ["core=core"]
+
+[[suite]]
+name = "unit-test"
+package = "core"
+fast = true
+
+[[suite]]
+name = "app-integration"
+package = "app"
+args = ["--verbose"]
+fast = false
+```
+
+Then run everything in one command:
+
+```sh
+leancov test --clean --fast       # stage all packages, build selected targets, run fast suites in parallel, and report
+leancov test --list               # list configured suites
+leancov test --report --sort cov  # re-aggregate existing .cov profiles without rebuilding
+```
+
+### 6. AST-Guided, Coverage-Pruned & Proof-Aware Mutation Testing (`mutate`)
 
 `leancov mutate` parses computational declarations (`def`, `abbrev`, `instance`) with Lean's parser—skipping `theorem`s, `by` tactic proofs, type signatures, `termination_by` clauses, `have` obligations, attributes, pattern binders, and `s!"..."` interpolated strings (opt in with `--include-interp`)—and evaluates semantics-changing mutants inside a clean out-of-tree staged copy:
 
@@ -197,7 +245,7 @@ leancov mutate \
   --file MyLib/Policy.lean \
   --filter authorize \
   --sites build/leancov-stage/sites.json --profile-dir build/leancov-stage/profiles \
-  --git-diff origin/main --seed 0x77 \
+  --git-diff origin/main --seed 0x77 --jobs 4 --kinds cmp,bool,lit \
   --build-target my-tests --proof-target MyProofs \
   --timeout 30 \
   --min-score 80.0 \
@@ -209,7 +257,7 @@ leancov mutate \
 Key flags & execution model:
 
 - `(--file <relFile> | --src-dir <relDir>)...` — select individual files or directories to mutate; combine with `--git-diff <baseRef>` to mutate only changed/added lines.
-- `--filter <declSubstr>` (repeatable or comma-separated) — restrict mutations to matching declaration names; `--max-mutants <N>` with optional `--seed <N>` samples deterministically.
+- `--filter <declSubstr>` and `--kinds <cmp,arith,bool,lit,neg,cond>` (repeatable or comma-separated) — restrict mutations by declaration name or operator kind; `--jobs <N>` evaluates mutants in parallel across cloned warm worker workspaces; `--max-mutants <N>` with optional `--seed <N>` samples deterministically.
 - `--sites` + `--profile` / `--profile-dir` — skips mutants on 0-hit uncovered lines/functions immediately (`uncovered`, excluded from denominator).
 - `--build-target <lakeTarget>` (repeatable) — target(s) built per mutant inside the staged workspace (`--out <workDir>`, default `<pkgDir>/.lake/build/leancov-mutate`); `--proof-target <lakeTarget>` catches mutants rejected by formal theorem targets (`proved`).
 - **Outcome classification:** mutants rejected by Lean's typechecker in build targets are classified as **`uncompilable`** and mutants on 0-hit lines as **`uncovered`** (both excluded from denominator); mutants caught by `--proof-target` are **`proved`**, and compiled mutants are run with a wall-clock `--timeout <sec>` (default `30`s), yielding **`killed`**, **`timeout`**, or **`survived`**.
@@ -243,19 +291,16 @@ leancov report \
   --max-cog-crap 200.0
 ```
 
-Example GitHub Actions step:
+Example GitHub Actions step using the reusable `LeanNative/leancov` composite action:
 
 ```yaml
-- name: Coverage & quality gates
-  run: |
-    leancov stage --pkg . --out build/stage --leancov .lake/packages/leancov --exclude Proofs/
-    (cd build/stage && lake build my-tests)
-    leancov run --sites build/stage/sites.json --profile build/stage/tests.cov \
-      -- build/stage/.lake/build/bin/my-tests
-    leancov report --sites build/stage/sites.json --profile build/stage/tests.cov \
-      --files --kinds --sort cog --top 20 \
-      --lcov build/stage/lcov.info \
-      --min-cov 75.0 --max-crap 100.0 --max-cog-crap 200.0
+- name: LeanCov Coverage & Quality Gates
+  uses: LeanNative/leancov@v0.4.0
+  with:
+    config: leancov.toml
+    min-cov: "75.0"
+    max-crap: "100.0"
+    max-cog-crap: "200.0"
 ```
 
 ## Using `LeanCov.Check` and `LeanCov.Fuzz`
@@ -317,7 +362,7 @@ Coverage-guided fuzzing uses in-process AFL edge-bucket feedback by default (`--
 - **`LEAN_COV_DEFER_INIT=1` + `main` arming:** `leancov stage` injects `LeanCov.arm ()` at entry to executable `def main` declarations (both top-level and inside the file's matching module namespace), and `leancov run` sets `LEAN_COV_DEFER_INIT=1` whenever `armOnMain: true`. Hits fired during `initialize_*` module startup before `main` runs are ignored so unexercised code never receives artificial startup coverage.
 - **Pure 0-arg CAF exclusion:** Zero-argument value declarations whose initializers only run during module startup (`def table := #[1, 2, 3]`, `def sbox : ByteArray := Id.run do ...`, and pure-constant-only `instance ... where`) are excluded by default from function and branch denominators so `LEAN_COV_DEFER_INIT=1` never leaves precomputed tables at 0% (pass `--include-cafs` to include them). Straight-line callable declarations (`def f (x : A) := ...`, point-free `fun` lambdas, monadic `IO`/`StateM`/`ExceptT` actions, arrow-returning constants, and callable `instance ... where` field implementations) receive an `fn.entry` probe that counts toward function/line coverage without inflating branch coverage.
 - **`where` helper definitions folded into enclosing declarations:** Local `where` helpers are traversed as part of their parent declaration, folding their probe sites and McCabe/Cognitive complexity into the enclosing function rather than reporting synthetic auxiliary names separately.
-- **Smart `loop.skip` on `for`/`while` loops:** Line-start `for` and `while` loops allocate a local flag to record both `loop.body` and 0-iteration `loop.skip`, except for `for` loops whose collection is statically guaranteed non-empty (`[a:b]`/`[:b]` with `a < b` and `step > 0`, or non-empty `[x, ...]` / `#[x, ...]` literals), where a `loop.skip` probe would be mathematically unreachable. Inline loops that do not begin at the start of a line (e.g., `else for x in xs do ...` on a single line) record `loop.body` without `loop.skip` so surrounding indentation-sensitive layout is never disturbed.
+- **Smart `loop.skip` on `for`/`while` loops:** Line-start `for` and `while` loops allocate a local flag to record both `loop.body` and 0-iteration `loop.skip`, except for `for` loops whose collection is statically guaranteed non-empty (`[a:b]`/`[:b]` with `a < b` and `step > 0`, or non-empty `[x, ...]` / `#[x, ...]` literals) and `while true do` / `while (Bool.true) do` loops, where a `loop.skip` probe would be mathematically unreachable. Inline loops that do not begin at the start of a line (e.g., `else for x in xs do ...` on a single line) record `loop.body` without `loop.skip` so surrounding indentation-sensitive layout is never disturbed.
 
 ## Runtime Environment Variables
 

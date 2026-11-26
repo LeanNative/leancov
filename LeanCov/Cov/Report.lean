@@ -436,10 +436,11 @@ structure ReportFilter where
   files : Array String := #[]
   decls : Array String := #[]
   excludeKinds : Array BranchKind := #[]
+  excludeInstances : Bool := false
   deriving Inhabited
 
 def ReportFilter.isEmpty (flt : ReportFilter) : Bool :=
-  flt.files.isEmpty && flt.decls.isEmpty && flt.excludeKinds.isEmpty
+  flt.files.isEmpty && flt.decls.isEmpty && flt.excludeKinds.isEmpty && !flt.excludeInstances
 
 private def matchesAnySubstr (pats : Array String) (s : String) : Bool :=
   pats.isEmpty || pats.any fun p => !p.isEmpty && (s.splitOn p).length > 1
@@ -447,7 +448,14 @@ private def matchesAnySubstr (pats : Array String) (s : String) : Bool :=
 /-- Filter manifest sites and functions without renumbering `Site.id`, preserving `.cov` counter alignment. -/
 def filterManifest (m : Manifest) (flt : ReportFilter) : Manifest := Id.run do
   if flt.isEmpty then return m
+  let mut instSiteIds : Std.HashMap Nat Bool := {}
+  if flt.excludeInstances then
+    for f in m.functions do
+      if f.isInstance then
+        for sid in f.siteIds do
+          instSiteIds := instSiteIds.insert sid true
   let keptSites := m.sites.filter fun s =>
+    !instSiteIds.contains s.id &&
     matchesAnySubstr flt.files s.file &&
     matchesAnySubstr flt.decls s.decl &&
     !flt.excludeKinds.contains s.kind
@@ -456,6 +464,8 @@ def filterManifest (m : Manifest) (flt : ReportFilter) : Manifest := Id.run do
     keptIds := keptIds.insert s.id true
   let mut keptFns : Array FuncInfo := #[]
   for f in m.functions do
+    if flt.excludeInstances && f.isInstance then
+      continue
     if matchesAnySubstr flt.files f.file && matchesAnySubstr flt.decls f.name then
       let fSites := f.siteIds.filter keptIds.contains
       if !f.siteIds.isEmpty && fSites.isEmpty then

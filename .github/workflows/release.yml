@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package and publish (e.g. v0.4.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-latest
+            target: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Lean via elan
+        shell: bash
+        run: |
+          TOOLCHAIN="$(tr -d '[:space:]' < lean-toolchain)"
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf \
+            | sh -s -- -y --default-toolchain "$TOOLCHAIN"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Build & test
+        run: |
+          lake build leancov leancov-rt-test leancov-test leancov-fuzz-test
+          .lake/build/bin/leancov --version
+          .lake/build/bin/leancov-rt-test
+          .lake/build/bin/leancov-test
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="dist/leancov"
+          rm -rf dist
+          mkdir -p "$STAGE/bin" "$STAGE/c" "$STAGE/LeanCov"
+          cp .lake/build/bin/leancov "$STAGE/bin/leancov"
+          chmod +x "$STAGE/bin/leancov"
+          cp lean-toolchain lakefile.lean LICENSE README.md "$STAGE/"
+          cp c/leancov_rt.c "$STAGE/c/leancov_rt.c"
+          for f in Runtime.lean DoSyntax.lean Check.lean Fuzz.lean; do
+            cp "LeanCov/$f" "$STAGE/LeanCov/$f"
+          done
+          ARCHIVE="leancov-${TAG}-${TARGET}.tar.gz"
+          tar -C dist -czf "dist/${ARCHIVE}" leancov
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          else
+            (cd dist && shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256")
+          fi
+          ls -lh dist/
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/*.tar.gz artifacts/*.sha256 --clobber
+          else
+            gh release create "$TAG" artifacts/*.tar.gz artifacts/*.sha256 \
+              --title "$TAG" --generate-notes
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
